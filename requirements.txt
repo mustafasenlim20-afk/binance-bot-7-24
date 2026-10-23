@@ -2,3 +2,4 @@ flask
 ccxt
 python-dotenv
 requests
+pandas
