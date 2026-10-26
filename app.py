@@ -99,19 +99,6 @@ def get_signal(sym):
     votes.append(1 if (r["k"] > r["d"] and r["k"] < 80) else (-1 if (r["k"] < r["d"] and r["k"] > 20) else 0))
     return sum(votes), float(r["atr"])
 
-def get_signal(sym):
-    raw = ex.fetch_ohlcv(sym, TIMEFRAME, limit=200)
-    df = pd.DataFrame(raw, columns=["t", "open", "high", "low", "close", "volume"])
-    df = add_indicators(df)
-    r, p = df.iloc[-2], df.iloc[-3]
-    votes = []
-    votes.append(1 if r.ema9 > r.ema21 else -1)
-    votes.append(1 if 50 < r.rsi < 70 else (-1 if 30 < r.rsi < 50 else 0))
-    votes.append(1 if (r.hist > 0 and r.hist > p.hist) else (-1 if (r.hist < 0 and r.hist < p.hist) else 0))
-    votes.append(1 if r.bb_mid < r.close < r.bb_up else (-1 if r.bb_lo < r.close < r.bb_mid else 0))
-    votes.append(1 if (r.k > r.d and r.k < 80) else (-1 if (r.k < r.d and r.k > 20) else 0))
-    return sum(votes), float(r.atr)
-
 def get_pos(sym):
     for p in ex.fetch_positions([sym]):
         amt = float(p.get("contracts") or 0)
