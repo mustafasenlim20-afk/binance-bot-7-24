@@ -74,17 +74,20 @@ def add_indicators(df):
     df["rsi"] = 100 - 100 / (1 + up / dn.replace(0, 1e-12))
     macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
     df["hist"] = macd - macd.ewm(span=9, adjust=False).mean()
-    df["bb_mid"] = c.rolling(20).mean()
-    std = c.rolling(20).std()
-    df["bb_up"] = df["bb_mid"] + 2 * std
-    df["bb_lo"] = df["bb_mid"] - 2 * std
-    ll, hh = l.rolling(14).min(), h.rolling(14).max()
-    k = 100 * (c - ll) / (hh - ll).replace(0, 1e-12)
-    df["k"] = k.rolling(3).mean()
-    df["d"] = df["k"].rolling(3).mean()
-    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-    df["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
-    return df
+def tranche_qty(sym, price, lev):
+    calculated_notional = balance() * MARGIN_PCT / TRANCHES * lev
+    notional = max(calculated_notional, 1.0)  # $1 minimum işlem tabanı
+    
+    qty = float(ex.amount_to_precision(sym, notional / price))
+    m = ex.market(sym)
+    min_amt = (m["limits"]["amount"]["min"] or 0)
+    min_cost = (m["limits"]["cost"]["min"] or 1.0)
+    
+    if qty < min_amt or qty * price < min_cost:
+        log.warning(f"{sym} parca cok kucuk ($1 altı veya borsa limitinde), min limitlere çekiliyor.")
+        return 0.0
+    return qty
+
 
 def get_signal(sym):
     raw = ex.fetch_ohlcv(sym, TIMEFRAME, limit=200)
