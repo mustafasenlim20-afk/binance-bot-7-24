@@ -132,17 +132,7 @@ def place_stop(sym, side, amt, price):
 
 def balance():
     return float(ex.fetch_balance()["USDT"]["total"])
-
-def tranche_qty(sym, price, lev):
-    notional = balance() * MARGIN_PCT / TRANCHES * lev
-    qty = float(ex.amount_to_precision(sym, notional / price))
-    m = ex.market(sym)
-    min_amt = (m["limits"]["amount"]["min"] or 0)
-    min_cost = (m["limits"]["cost"]["min"] or 0)
-    if qty < min_amt or qty * price < min_cost:
-        log.warning(f"{sym} parca cok kucuk")
-        return 0.0
-    return qty
+    
 
 def market_order(sym, side, qty, reduce=False):
     params = {"reduceOnly": True} if reduce else {}
