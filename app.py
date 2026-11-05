@@ -63,7 +63,7 @@ if TESTNET:
     ex.set_sandbox_mode(True)
 
 state = {}
- def add_indicators(df):
+def add_indicators(df):
     c, h, l = df["close"], df["high"], df["low"]
     df["ema9"] = c.ewm(span=9, adjust=False).mean()
     df["ema21"] = c.ewm(span=21, adjust=False).mean()
