@@ -15,7 +15,23 @@ from flask import Flask
 app = Flask(__name__)
 
 # ===================== AYARLAR =====================
-SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT", "AVAX/USDT:USDT", "ADA/USDT:USDT", "LINK/USDT:USDT", "LTC/USDT:USDT", "TRX/USDT:USDT", "DOT/USDT:USDT", "MATIC/USDT:USDT", "SHIB/USDT:USDT", "NEAR/USDT:USDT"]
+SYMBOLS = [
+    "BTC/USDT:USDT",
+    "ETH/USDT:USDT",
+    "SOL/USDT:USDT",
+    "BNB/USDT:USDT",
+    "XRP/USDT:USDT",
+    "DOGE/USDT:USDT",
+    "AVAX/USDT:USDT",
+    "ADA/USDT:USDT",
+    "LINK/USDT:USDT",
+    "LTC/USDT:USDT",
+    "TRX/USDT:USDT",
+    "DOT/USDT:USDT",
+    "POL/USDT:USDT",  # MATIC yerine POL yapıldı
+    "NEAR/USDT:USDT",
+]
+
 TIMEFRAME = "15m"
 LOOP_SECONDS = 120
 MIN_SCORE = 4
