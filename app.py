@@ -84,7 +84,7 @@ def add_indicators(df):
     df["k"] = 100 * (c - low14) / (high14 - low14).replace(0, 1e-12)
     df["d"] = df["k"].rolling(3).mean()
     return df
- def tranche_qty(sym, price, lev):
+def tranche_qty(sym, price, lev):
     notional = max(balance() * MARGIN_PCT / TRANCHES * lev, 10)
     qty = float(ex.amount_to_precision(sym, notional / price))
     m = ex.market(sym)
