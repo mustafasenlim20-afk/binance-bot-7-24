@@ -256,6 +256,13 @@ def home():
 # Botu arka planda baslat
 threading.Thread(target=bot_loop, daemon=True).start()
 
+@app.route('/ip')
+def get_ip():
+    import requests
+    from flask import jsonify
+    return jsonify({"ip": requests.get('https://api.ipify.org').text})
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
