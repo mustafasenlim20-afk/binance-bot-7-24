@@ -84,18 +84,13 @@ def add_indicators(df):
     df["k"] = 100 * (c - low14) / (high14 - low14).replace(0, 1e-12)
     df["d"] = df["k"].rolling(3).mean()
     return df
-def tranche_qty(sym, price, lev):
-    calculated_notional = balance() * MARGIN_PCT / TRANCHES * lev
-    notional = max(calculated_notional, 1.0)  # $1 minimum işlem tabanı
-    
+ def tranche_qty(sym, price, lev):
+    notional = max(balance() * MARGIN_PCT / TRANCHES * lev, 10)
     qty = float(ex.amount_to_precision(sym, notional / price))
     m = ex.market(sym)
     min_amt = (m["limits"]["amount"]["min"] or 0)
-    min_cost = (m["limits"]["cost"]["min"] or 1.0)
-    
-    if qty < min_amt or qty * price < min_cost:
-        log.warning(f"{sym} parca cok kucuk ($1 altı veya borsa limitinde), min limitlere çekiliyor.")
-        return 0.0
+    if qty < min_amt:
+        qty = float(ex.amount_to_precision(sym, min_amt))
     return qty
 
 
