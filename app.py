@@ -63,17 +63,27 @@ if TESTNET:
     ex.set_sandbox_mode(True)
 
 state = {}
-
-def add_indicators(df):
+ def add_indicators(df):
     c, h, l = df["close"], df["high"], df["low"]
     df["ema9"] = c.ewm(span=9, adjust=False).mean()
     df["ema21"] = c.ewm(span=21, adjust=False).mean()
+    tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    df["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
     delta = c.diff()
-    up = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
-    dn = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    up = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    dn = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
     df["rsi"] = 100 - 100 / (1 + up / dn.replace(0, 1e-12))
     macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
     df["hist"] = macd - macd.ewm(span=9, adjust=False).mean()
+    df["bb_mid"] = c.rolling(20).mean()
+    std = c.rolling(20).std()
+    df["bb_up"] = df["bb_mid"] + 2*std
+    df["bb_lo"] = df["bb_mid"] - 2*std
+    low14 = l.rolling(14).min()
+    high14 = h.rolling(14).max()
+    df["k"] = 100 * (c - low14) / (high14 - low14).replace(0, 1e-12)
+    df["d"] = df["k"].rolling(3).mean()
+    return df
 def tranche_qty(sym, price, lev):
     calculated_notional = balance() * MARGIN_PCT / TRANCHES * lev
     notional = max(calculated_notional, 1.0)  # $1 minimum işlem tabanı
