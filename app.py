@@ -16,10 +16,6 @@ app = Flask(__name__)
 
 # ===================== AYARLAR =====================
 SYMBOLS = [
-    "BTC/USDT:USDT",
-    "ETH/USDT:USDT",
-    "SOL/USDT:USDT",
-    "BNB/USDT:USDT",
     "XRP/USDT:USDT",
     "DOGE/USDT:USDT",
     "AVAX/USDT:USDT",
