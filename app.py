@@ -271,5 +271,17 @@ def get_ip():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
+        # --- WEBSOCKET ARKA PLAN DİNLEYİCİSİ ---
+    from websocket_listener import start_websocket
+    
+    def run_ws():
+        try:
+            start_websocket()
+        except Exception as e:
+            print(f"WebSocket başlatma hatası: {e}")
+
+    ws_thread = threading.Thread(target=run_ws, daemon=True)
+    ws_thread.start()
+
     app.run(host="0.0.0.0", port=port)
 
