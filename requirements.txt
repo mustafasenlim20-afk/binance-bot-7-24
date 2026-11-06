@@ -3,3 +3,4 @@ ccxt
 python-dotenv
 requests
 pandas
+websocket-client
