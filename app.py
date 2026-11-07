@@ -1,4 +1,4 @@
-""
+"""
 Binance USDT-M Futures botu (7/24, FİYAT SINIRLI DİNAMİK SEÇİM, long + short) - RENDER UYUMLU
 - BTC/ETH gibi pahalı coinleri eler, ADA/XRP/DOGE gibi altcoinlere odaklanır
 - Proxy destekli
