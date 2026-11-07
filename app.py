@@ -3,7 +3,7 @@ Binance USDT-M Futures botu (7/24, 3'te 2 İndikatör Filtresi, long + short) - 
 - BTC/ETH gibi pahalı coinleri eler, ADA/XRP/DOGE gibi altcoinlere odaklanır
 - Proxy destekli
 - Flask ile 7/24 ayakta
-- Rate-limit korumalı
+- Rate-limit korumalı ve Ortalama Maliyet Düzeltmeli
 """
 import os
 import json
@@ -122,14 +122,8 @@ def get_signal(sym):
     r, p = df.iloc[-2], df.iloc[-3]
     
     votes = []
-    
-    # 1. EMA (Trend Filtresi)
     votes.append(1 if r["ema9"] > r["ema21"] else -1)
-    
-    # 2. RSI (Momentum Filtresi)
     votes.append(1 if 50 < r["rsi"] < 70 else (-1 if 30 < r["rsi"] < 50 else 0))
-    
-    # 3. MACD Histogram (İvme Filtresi)
     votes.append(1 if (r["hist"] > 0 and r["hist"] > p["hist"]) else (-1 if (r["hist"] < 0 and r["hist"] < p["hist"]) else 0))
     
     score = sum(votes)
@@ -139,7 +133,11 @@ def get_pos(sym):
     for p in ex.fetch_positions([sym]):
         amt = float(p.get("contracts") or 0)
         if amt > 0:
-            return {"side": p["side"], "amt": amt, "entry": float(p["entryPrice"])}
+            return {
+                "side": p["side"], 
+                "amt": amt, 
+                "entry": float(p["entryPrice"] if p.get("entryPrice") else 0)
+            }
     return None
 
 def cancel_orders(sym):
@@ -187,10 +185,20 @@ def open_first(sym, direction, score, atr, price):
     market_order(sym, "buy" if direction == 1 else "sell", qty)
     pos = get_pos(sym)
     if not pos: return
+    
+    # Ortalama maliyet üzerinden ilk stop seviyesi
     sl = pos["entry"] - direction * SL_ATR * atr
     
     with state_lock:
-        state[sym] = {"tranches": 1, "last_add": pos["entry"], "atr": atr, "sl": sl, "tp1": False, "tp2": False, "lev": lev}
+        state[sym] = {
+            "tranches": 1, 
+            "last_add": pos["entry"], 
+            "atr": atr, 
+            "sl": sl, 
+            "tp1": False, 
+            "tp2": False, 
+            "lev": lev
+        }
     
     place_stop(sym, pos["side"], pos["amt"], sl)
     log.info(f"{sym} {'LONG' if direction == 1 else 'SHORT'} acildi (Skor: {score})")
@@ -200,7 +208,6 @@ def manage(sym):
     price = float(ex.fetch_ticker(sym)["last"])
     pos = get_pos(sym)
     
-    # Hangi coine bakıldığını ve kaç skor aldığını loglarda görelim
     log.info(f"Tarama -> {sym} | Fiyat: {price} | Skor: {score}/3")
     
     with state_lock:
@@ -224,37 +231,62 @@ def manage(sym):
     d = 1 if pos["side"] == "long" else -1
     
     if st is None:
-        st = {"tranches": 1, "last_add": pos["entry"], "atr": atr, "sl": pos["entry"] - d * SL_ATR * atr, "tp1": False, "tp2": False, "lev": 5}
+        st = {
+            "tranches": 1, 
+            "last_add": pos["entry"], 
+            "atr": atr, 
+            "sl": pos["entry"] - d * SL_ATR * atr, 
+            "tp1": False, 
+            "tp2": False, 
+            "lev": 5
+        }
         with state_lock:
             state[sym] = st
         place_stop(sym, pos["side"], pos["amt"], st["sl"])
 
-    if (price - st["sl"]) * d <= 0: return close_all(sym, "stop")
-    if score * d <= -MIN_SCORE: return close_all(sym, "ters sinyal")
+    # Stop-loss kontrolü (Güncel ortalama maliyet üzerinden)
+    if (price - st["sl"]) * d <= 0: 
+        return close_all(sym, "stop")
     
-    profit = (price - pos["entry"]) * d
+    # Ters sinyal kontrolü
+    if score * d <= -MIN_SCORE: 
+        return close_all(sym, "ters sinyal")
+    
+    # Gerçek ortalama maliyete göre kâr hesaplama
+    avg_entry = pos["entry"]
+    profit = (price - avg_entry) * d
+    
+    # TP1 Kontrolü (%50 Kısmi Satış)
     if not st["tp1"] and profit >= TP1_ATR * st["atr"]:
         if close_part(sym, pos, 0.5, "TP1"):
             st["tp1"] = True
-            st["sl"] = pos["entry"] + d * 0.1 * st["atr"]
+            # TP1 alındıktan sonra stop'u maliyetin hafif üstüne (kârda kapatmak için) çek
+            st["sl"] = avg_entry + d * 0.1 * st["atr"]
             pos = get_pos(sym)
-            place_stop(sym, pos["side"], pos["amt"], st["sl"])
+            if pos:
+                place_stop(sym, pos["side"], pos["amt"], st["sl"])
         return
         
+    # TP2 Kontrolü (%50 Kısmi Satış - Kalanın yarısı)
     if st["tp1"] and not st["tp2"] and profit >= TP2_ATR * st["atr"]:
         if close_part(sym, pos, 0.5, "TP2"):
             st["tp2"] = True
             pos = get_pos(sym)
-            place_stop(sym, pos["side"], pos["amt"], st["sl"])
+            if pos:
+                place_stop(sym, pos["side"], pos["amt"], st["sl"])
         return
         
+    # Trailing Stop Mekanizması (TP1 olduktan sonra fiyatı takip eder)
     if st["tp1"]:
         new_sl = price - d * TRAIL_ATR * st["atr"]
         if (new_sl - st["sl"]) * d > 0:
             st["sl"] = new_sl
-            place_stop(sym, pos["side"], pos["amt"], st["sl"])
+            pos = get_pos(sym)
+            if pos:
+                place_stop(sym, pos["side"], pos["amt"], st["sl"])
         return
         
+    # Kademeli Ekleme (DCA) Kontrolü
     if (st["tranches"] < TRANCHES and score * d >= MIN_SCORE and (price - st["last_add"]) * d >= ADD_ATR * st["atr"]):
         qty = tranche_qty(sym, price, st["lev"])
         if qty > 0:
@@ -262,7 +294,8 @@ def manage(sym):
             st["tranches"] += 1
             st["last_add"] = price
             pos = get_pos(sym)
-            place_stop(sym, pos["side"], pos["amt"], st["sl"])
+            if pos:
+                place_stop(sym, pos["side"], pos["amt"], st["sl"])
 
 def save_state():
     with state_lock:
