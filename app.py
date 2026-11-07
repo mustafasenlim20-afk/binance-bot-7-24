@@ -1,6 +1,6 @@
 """
-Binance USDT-M Futures botu (7/24, DİNAMİK COİN SEÇİmlİ, long + short) - RENDER UYUMLU
-- Otomatik en yüksek hacimli coinleri seçer
+Binance USDT-M Futures botu (7/24, FİYAT SINIRLI DİNAMİK SEÇİM, long + short) - RENDER UYUMLU
+- BTC/ETH gibi pahalı coinleri eler, ADA/XRP/DOGE gibi altcoinlere odaklanır
 - Proxy destekli
 - Flask ile 7/24 ayakta
 - Rate-limit korumalı
@@ -32,6 +32,7 @@ TRAIL_ATR = 1.2
 MAX_DRAWDOWN = 0.20
 STATE_FILE = "bot_state.json"
 TESTNET = False
+MAX_COIN_PRICE = 500.0  # BTC ve ETH gibi pahalı coinleri elemek için üst fiyat sınırı (USDT)
 # ===================================================
 
 logging.basicConfig(
@@ -66,26 +67,29 @@ state = {}
 state_lock = threading.Lock()
 
 def get_dynamic_symbols():
-    """Binance piyasasındaki hacmi en yüksek ilk 10 USDT-M vadeli coinini otomatik seçer"""
+    """Binance piyasasındaki hacmi yüksek, ancak fiyatı 500 USDT'den ucuz olan altcoinleri seçer (ADA, XRP tarzı)"""
     try:
         tickers = ex.fetch_tickers()
-        # USDT ile biten ve perpetual (sürekli) vadeli olanları filtrele
         valid_tickers = {}
         for symbol, data in tickers.items():
             if symbol.endswith(':USDT') and 'quoteVolume' in data:
-                # Stablecoin'leri (USDC vb.) hariç tutalım
                 base = symbol.split('/')[0]
-                if base not in ['USDC', 'BUSD', 'FDUSD', 'TUSD']:
+                # Stablecoin'leri ve pahalı dev coinleri (BTC, ETH vb.) dışarıda bırak
+                if base in ['USDC', 'BUSD', 'FDUSD', 'TUSD', 'BTC', 'ETH', 'BNB', 'SOL']:
+                    continue
+                
+                last_price = data.get('last') or 0
+                # Fiyat belirlenen üst sınırın altındaysa ve hacmi varsa listeye ekle
+                if 0 < last_price <= MAX_COIN_PRICE:
                     valid_tickers[symbol] = data['quoteVolume'] or 0
         
-        # Hacme göre büyükten küçüğe sırala ve ilk 10'u al
+        # Hacme göre büyükten küçüğe sırala ve ilk 10 altcoini al
         sorted_symbols = sorted(valid_tickers.keys(), key=lambda x: valid_tickers[x], reverse=True)
         top_symbols = sorted_symbols[:10]
-        log.info(f"Dinamik seçilen en hacimli 10 coin: {top_symbols}")
+        log.info(f"Dinamik seçilen en hacimli altcoinler: {top_symbols}")
         return top_symbols
     except Exception as e:
         log.error(f"Dinamik coin seçme hatası: {e}")
-        # Hata olursa yedek sabit liste dön
         return ["XRP/USDT:USDT", "DOGE/USDT:USDT", "AVAX/USDT:USDT", "ADA/USDT:USDT", "LINK/USDT:USDT"]
 
 def add_indicators(df):
@@ -283,20 +287,18 @@ def bot_loop():
     while True:
         try:
             if balance() < start_bal * (1 - MAX_DRAWDOWN):
-                # Açık olan tüm pozisyonları kapatalım (dinamik listeden bağımsız mevcut pozisyonları bulup kapatır)
                 for p in ex.fetch_positions():
                     if float(p.get("contracts") or 0) > 0:
                         close_all(p['symbol'], "drawdown")
                 save_state()
                 break
                 
-            # Her döngünün başında o anki en popüler 10 coini dinamik seç
             current_symbols = get_dynamic_symbols()
                 
             for sym in current_symbols:
                 try:
                     manage(sym)
-                    time.sleep(1.5) # Rate limit koruması için nefes payı
+                    time.sleep(1.5)
                 except Exception as e: 
                     log.error(f"{sym} hata: {e}")
             save_state()
@@ -310,7 +312,7 @@ def home():
         bal = balance()
         with state_lock:
             keys = list(state.keys())
-        return f"BOT CANLI BABAM! (Dinamik Tarayıcı Aktif) | Bakiye: {bal} USDT | Pozisyonlar: {keys} | Proxy: OK"
+        return f"BOT CANLI BABAM! (Altcoin Fiyat Sınırlandı) | Bakiye: {bal} USDT | Pozisyonlar: {keys} | Proxy: OK"
     except Exception as e:
         return f"Bot ayakta ama Binance hatasi: {e} | Proxy: {PROXY_URL}"
 
