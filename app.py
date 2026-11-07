@@ -2,6 +2,7 @@
 Binance USDT-M Futures botu (7/24, long + short) - RENDER UYUMLU
 - Proxy destekli
 - Flask ile 7/24 ayakta
+- Rate-limit korumalı (418 önlemli)
 """
 import os
 import json
@@ -10,7 +11,7 @@ import logging
 import threading
 import ccxt
 import pandas as pd
-from flask import Flask
+from flask import Flask, jsonify
 
 app = Flask(__name__)
 
@@ -24,12 +25,12 @@ SYMBOLS = [
     "LTC/USDT:USDT",
     "TRX/USDT:USDT",
     "DOT/USDT:USDT",
-    "POL/USDT:USDT",  # MATIC yerine POL yapıldı
+    "POL/USDT:USDT",
     "NEAR/USDT:USDT",
 ]
 
 TIMEFRAME = "15m"
-LOOP_SECONDS = 240
+LOOP_SECONDS = 360  # Ban yeme riskini azaltmak için süreyi uzattık (6 dakika)
 MIN_SCORE = 4
 LEV_BY_SCORE = {3: 5, 4: 7, 5: 10}
 MARGIN_PCT = 0.30
@@ -52,7 +53,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
-# ===== PROXY EKLENDI BABAM - BURASI COZUM =====
 PROXY_URL = os.getenv("PROXY_URL")
 print(f"Proxy kontrol: {PROXY_URL}")
 
@@ -75,6 +75,8 @@ if TESTNET:
     ex.set_sandbox_mode(True)
 
 state = {}
+state_lock = threading.Lock()
+
 def add_indicators(df):
     c, h, l = df["close"], df["high"], df["low"]
     df["ema9"] = c.ewm(span=9, adjust=False).mean()
@@ -96,6 +98,10 @@ def add_indicators(df):
     df["k"] = 100 * (c - low14) / (high14 - low14).replace(0, 1e-12)
     df["d"] = df["k"].rolling(3).mean()
     return df
+
+def balance():
+    return float(ex.fetch_balance()["USDT"]["total"])
+
 def tranche_qty(sym, price, lev):
     notional = max(balance() * MARGIN_PCT / TRANCHES * lev, 10)
     qty = float(ex.amount_to_precision(sym, notional / price))
@@ -104,7 +110,6 @@ def tranche_qty(sym, price, lev):
     if qty < min_amt:
         qty = float(ex.amount_to_precision(sym, min_amt))
     return qty
-
 
 def get_signal(sym):
     raw = ex.fetch_ohlcv(sym, TIMEFRAME, limit=200)
@@ -137,10 +142,6 @@ def place_stop(sym, side, amt, price):
     ex.create_order(sym, "STOP_MARKET", close_side, float(ex.amount_to_precision(sym, amt)), None, {"stopPrice": float(ex.price_to_precision(sym, price)), "reduceOnly": True})
     log.info(f"{sym} stop -> {price:.6f}")
 
-def balance():
-    return float(ex.fetch_balance()["USDT"]["total"])
-    
-
 def market_order(sym, side, qty, reduce=False):
     params = {"reduceOnly": True} if reduce else {}
     return ex.create_order(sym, "market", side, qty, None, params)
@@ -152,7 +153,8 @@ def close_all(sym, why):
         side = "sell" if pos["side"] == "long" else "buy"
         market_order(sym, side, pos["amt"], reduce=True)
         log.info(f"{sym} KAPATILDI ({why})")
-    state.pop(sym, None)
+    with state_lock:
+        state.pop(sym, None)
 
 def close_part(sym, pos, fraction, why):
     qty = float(ex.amount_to_precision(sym, pos["amt"] * fraction))
@@ -175,7 +177,10 @@ def open_first(sym, direction, score, atr, price):
     pos = get_pos(sym)
     if not pos: return
     sl = pos["entry"] - direction * SL_ATR * atr
-    state[sym] = {"tranches": 1, "last_add": pos["entry"], "atr": atr, "sl": sl, "tp1": False, "tp2": False, "lev": lev}
+    
+    with state_lock:
+        state[sym] = {"tranches": 1, "last_add": pos["entry"], "atr": atr, "sl": sl, "tp1": False, "tp2": False, "lev": lev}
+    
     place_stop(sym, pos["side"], pos["amt"], sl)
     log.info(f"{sym} {'LONG' if direction == 1 else 'SHORT'} acildi")
 
@@ -183,22 +188,36 @@ def manage(sym):
     score, atr = get_signal(sym)
     price = float(ex.fetch_ticker(sym)["last"])
     pos = get_pos(sym)
+    
+    with state_lock:
+        is_in_state = sym in state
+        st = state.get(sym)
+
     if not pos:
-        if sym in state:
-            state.pop(sym)
+        if is_in_state:
+            with state_lock:
+                state.pop(sym, None)
             cancel_orders(sym)
-        if len(state) >= MAX_OPEN: return
+        
+        with state_lock:
+            active_count = len(state)
+        
+        if active_count >= MAX_OPEN: return
         if score >= MIN_SCORE: open_first(sym, 1, score, atr, price)
         elif score <= -MIN_SCORE: open_first(sym, -1, score, atr, price)
         return
+
     d = 1 if pos["side"] == "long" else -1
-    st = state.get(sym)
+    
     if st is None:
         st = {"tranches": 1, "last_add": pos["entry"], "atr": atr, "sl": pos["entry"] - d * SL_ATR * atr, "tp1": False, "tp2": False, "lev": 5}
-        state[sym] = st
+        with state_lock:
+            state[sym] = st
         place_stop(sym, pos["side"], pos["amt"], st["sl"])
+
     if (price - st["sl"]) * d <= 0: return close_all(sym, "stop")
     if score * d <= -MIN_SCORE: return close_all(sym, "ters sinyal")
+    
     profit = (price - pos["entry"]) * d
     if not st["tp1"] and profit >= TP1_ATR * st["atr"]:
         if close_part(sym, pos, 0.5, "TP1"):
@@ -207,18 +226,21 @@ def manage(sym):
             pos = get_pos(sym)
             place_stop(sym, pos["side"], pos["amt"], st["sl"])
         return
+        
     if st["tp1"] and not st["tp2"] and profit >= TP2_ATR * st["atr"]:
         if close_part(sym, pos, 0.5, "TP2"):
             st["tp2"] = True
             pos = get_pos(sym)
             place_stop(sym, pos["side"], pos["amt"], st["sl"])
         return
+        
     if st["tp1"]:
         new_sl = price - d * TRAIL_ATR * st["atr"]
         if (new_sl - st["sl"]) * d > 0:
             st["sl"] = new_sl
             place_stop(sym, pos["side"], pos["amt"], st["sl"])
         return
+        
     if (st["tranches"] < TRANCHES and score * d >= MIN_SCORE and (price - st["last_add"]) * d >= ADD_ATR * st["atr"]):
         qty = tranche_qty(sym, price, st["lev"])
         if qty > 0:
@@ -229,59 +251,59 @@ def manage(sym):
             place_stop(sym, pos["side"], pos["amt"], st["sl"])
 
 def save_state():
-    with open(STATE_FILE, "w") as f: json.dump(state, f)
+    with state_lock:
+        with open(STATE_FILE, "w") as f: json.dump(state, f)
 
 def bot_loop():
     global state
     ex.load_markets()
     if os.path.exists(STATE_FILE):
-        try: state = json.load(open(STATE_FILE))
-        except: state = {}
+        try:
+            with open(STATE_FILE) as f:
+                with state_lock:
+                    state = json.load(f)
+        except:
+            with state_lock:
+                state = {}
+                
     start_bal = balance()
     log.info(f"Bot basladi | bakiye={start_bal:.2f} USDT")
+    
     while True:
         try:
             if balance() < start_bal * (1 - MAX_DRAWDOWN):
                 for s in SYMBOLS: close_all(s, "drawdown")
                 save_state()
                 break
+                
             for sym in SYMBOLS:
-                try: manage(sym)
-                except Exception as e: log.error(f"{sym} hata: {e}")
+                try:
+                    manage(sym)
+                    time.sleep(1.5) # Her sembol taraması arasına 1.5 saniye nefes ekledik (Rate Limit koruması)
+                except Exception as e: 
+                    log.error(f"{sym} hata: {e}")
             save_state()
-        except Exception as e: log.error(f"Dongu hatasi: {e}")
+        except Exception as e: 
+            log.error(f"Dongu hatasi: {e}")
         time.sleep(LOOP_SECONDS)
 
 @app.route('/')
 def home():
     try:
         bal = balance()
-        return f"BOT CANLI BABAM! Bakiye: {bal} USDT | Pozisyonlar: {list(state.keys())} | Proxy: OK"
+        with state_lock:
+            keys = list(state.keys())
+        return f"BOT CANLI BABAM! Bakiye: {bal} USDT | Pozisyonlar: {keys} | Proxy: OK"
     except Exception as e:
         return f"Bot ayakta ama Binance hatasi: {e} | Proxy: {PROXY_URL}"
-
-# Botu arka planda baslat
-threading.Thread(target=bot_loop, daemon=True).start()
 
 @app.route('/ip')
 def get_ip():
     import requests
-    from flask import jsonify
     return jsonify({"ip": requests.get('https://api.ipify.org').text})
+
+threading.Thread(target=bot_loop, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-        # --- WEBSOCKET ARKA PLAN DİNLEYİCİSİ ---
-    from websocket_listener import start_websocket
-    
-    def run_ws():
-        try:
-            start_websocket()
-        except Exception as e:
-            print(f"WebSocket başlatma hatası: {e}")
-
-    ws_thread = threading.Thread(target=run_ws, daemon=True)
-    ws_thread.start()
-
     app.run(host="0.0.0.0", port=port)
-
