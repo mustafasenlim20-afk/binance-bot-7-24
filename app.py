@@ -1,5 +1,5 @@
 """
-Binance USDT-M Futures botu (7/24, FİYAT SINIRLI DİNAMİK SEÇİM, long + short) - RENDER UYUMLU
+Binance USDT-M Futures botu (7/24, 3'te 2 İndikatör Filtresi, long + short) - RENDER UYUMLU
 - BTC/ETH gibi pahalı coinleri eler, ADA/XRP/DOGE gibi altcoinlere odaklanır
 - Proxy destekli
 - Flask ile 7/24 ayakta
@@ -19,8 +19,8 @@ app = Flask(__name__)
 # ===================== AYARLAR =====================
 TIMEFRAME = "15m"
 LOOP_SECONDS = 360  # Rate limit önlemi için döngü süresi
-MIN_SCORE = 4
-LEV_BY_SCORE = {3: 5, 4: 7, 5: 10}
+MIN_SCORE = 2       # 3 indikatörden en az 2'si uyarsa işlem açar (3'te 2 kuralı)
+LEV_BY_SCORE = {2: 5, 3: 8} # Skora göre kaldıraç
 MARGIN_PCT = 0.30
 TRANCHES = 3
 ADD_ATR = 1.0
@@ -74,16 +74,13 @@ def get_dynamic_symbols():
         for symbol, data in tickers.items():
             if symbol.endswith(':USDT') and 'quoteVolume' in data:
                 base = symbol.split('/')[0]
-                # Stablecoin'leri ve pahalı dev coinleri (BTC, ETH vb.) dışarıda bırak
                 if base in ['USDC', 'BUSD', 'FDUSD', 'TUSD', 'BTC', 'ETH', 'BNB', 'SOL']:
                     continue
                 
                 last_price = data.get('last') or 0
-                # Fiyat belirlenen üst sınırın altındaysa ve hacmi varsa listeye ekle
                 if 0 < last_price <= MAX_COIN_PRICE:
                     valid_tickers[symbol] = data['quoteVolume'] or 0
         
-        # Hacme göre büyükten küçüğe sırala ve ilk 10 altcoini al
         sorted_symbols = sorted(valid_tickers.keys(), key=lambda x: valid_tickers[x], reverse=True)
         top_symbols = sorted_symbols[:10]
         log.info(f"Dinamik seçilen en hacimli altcoinler: {top_symbols}")
@@ -104,14 +101,6 @@ def add_indicators(df):
     df["rsi"] = 100 - 100 / (1 + up / dn.replace(0, 1e-12))
     macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
     df["hist"] = macd - macd.ewm(span=9, adjust=False).mean()
-    df["bb_mid"] = c.rolling(20).mean()
-    std = c.rolling(20).std()
-    df["bb_up"] = df["bb_mid"] + 2*std
-    df["bb_lo"] = df["bb_mid"] - 2*std
-    low14 = l.rolling(14).min()
-    high14 = h.rolling(14).max()
-    df["k"] = 100 * (c - low14) / (high14 - low14).replace(0, 1e-12)
-    df["d"] = df["k"].rolling(3).mean()
     return df
 
 def balance():
@@ -131,13 +120,20 @@ def get_signal(sym):
     df = pd.DataFrame(raw, columns=["t", "open", "high", "low", "close", "volume"])
     df = add_indicators(df)
     r, p = df.iloc[-2], df.iloc[-3]
+    
     votes = []
+    
+    # 1. EMA (Trend Filtresi)
     votes.append(1 if r["ema9"] > r["ema21"] else -1)
+    
+    # 2. RSI (Momentum Filtresi)
     votes.append(1 if 50 < r["rsi"] < 70 else (-1 if 30 < r["rsi"] < 50 else 0))
+    
+    # 3. MACD Histogram (İvme Filtresi)
     votes.append(1 if (r["hist"] > 0 and r["hist"] > p["hist"]) else (-1 if (r["hist"] < 0 and r["hist"] < p["hist"]) else 0))
-    votes.append(1 if r["bb_mid"] < r["close"] < r["bb_up"] else (-1 if r["bb_lo"] < r["close"] < r["bb_mid"] else 0))
-    votes.append(1 if (r["k"] > r["d"] and r["k"] < 80) else (-1 if (r["k"] < r["d"] and r["k"] > 20) else 0))
-    return sum(votes), float(r["atr"])
+    
+    score = sum(votes)
+    return score, float(r["atr"])
 
 def get_pos(sym):
     for p in ex.fetch_positions([sym]):
@@ -182,7 +178,7 @@ def close_part(sym, pos, fraction, why):
     return True
 
 def open_first(sym, direction, score, atr, price):
-    lev = LEV_BY_SCORE.get(min(abs(score), 5), 5)
+    lev = LEV_BY_SCORE.get(min(abs(score), 3), 5)
     try: ex.set_margin_mode("isolated", sym)
     except: pass
     ex.set_leverage(lev, sym)
@@ -197,12 +193,15 @@ def open_first(sym, direction, score, atr, price):
         state[sym] = {"tranches": 1, "last_add": pos["entry"], "atr": atr, "sl": sl, "tp1": False, "tp2": False, "lev": lev}
     
     place_stop(sym, pos["side"], pos["amt"], sl)
-    log.info(f"{sym} {'LONG' if direction == 1 else 'SHORT'} acildi")
+    log.info(f"{sym} {'LONG' if direction == 1 else 'SHORT'} acildi (Skor: {score})")
 
 def manage(sym):
     score, atr = get_signal(sym)
     price = float(ex.fetch_ticker(sym)["last"])
     pos = get_pos(sym)
+    
+    # Hangi coine bakıldığını ve kaç skor aldığını loglarda görelim
+    log.info(f"Tarama -> {sym} | Fiyat: {price} | Skor: {score}/3")
     
     with state_lock:
         is_in_state = sym in state
@@ -282,7 +281,7 @@ def bot_loop():
                 state = {}
                 
     start_bal = balance()
-    log.info(f"Bot basladi | bakiye={start_bal:.2f} USDT")
+    log.info(f"Bot basladi (3'te 2 Kuralı Aktif) | bakiye={start_bal:.2f} USDT")
     
     while True:
         try:
@@ -312,7 +311,7 @@ def home():
         bal = balance()
         with state_lock:
             keys = list(state.keys())
-        return f"BOT CANLI BABAM! (Altcoin Fiyat Sınırlandı) | Bakiye: {bal} USDT | Pozisyonlar: {keys} | Proxy: OK"
+        return f"BOT CANLI BABAM! (3'te 2 İndikatör Modu) | Bakiye: {bal} USDT | Pozisyonlar: {keys} | Proxy: OK"
     except Exception as e:
         return f"Bot ayakta ama Binance hatasi: {e} | Proxy: {PROXY_URL}"
 
