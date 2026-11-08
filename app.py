@@ -4,6 +4,7 @@ Binance USDT-M Futures botu (7/24, 3'te 2 İndikatör Filtresi, long + short) - 
 - Proxy destekli
 - Flask ile 7/24 ayakta
 - Rate-limit korumalı ve Ortalama Maliyet Düzeltmeli
+- Kar Al (Take Profit) ve İzleyen Stop (Trailing Stop) Mekanizmalı
 """
 import os
 import json
@@ -17,7 +18,7 @@ from flask import Flask, jsonify
 app = Flask(__name__)
 
 # ===================== AYARLAR =====================
-TIMEFRAME = "15m"
+TIMEFRAME = "5m"        # Daha çevik ve hızlı tepki için 5 dakikalık periyot
 LOOP_SECONDS = 360  # Rate limit önlemi için döngü süresi
 MIN_SCORE = 2       # 3 indikatörden en az 2'si uyarsa işlem açar (3'te 2 kuralı)
 LEV_BY_SCORE = {2: 5, 3: 8} # Skora göre kaldıraç
@@ -26,9 +27,9 @@ TRANCHES = 3
 ADD_ATR = 1.0
 MAX_OPEN = 3
 SL_ATR = 1.5
-TP1_ATR = 1.5
-TP2_ATR = 3.0
-TRAIL_ATR = 1.2
+TP1_ATR = 1.2       # Kar al seviyesi daha hızlı realize olması için optimize edildi
+TP2_ATR = 2.5
+TRAIL_ATR = 1.0     # İzleyen stop mesafesi
 MAX_DRAWDOWN = 0.20
 STATE_FILE = "bot_state.json"
 TESTNET = False
@@ -186,7 +187,6 @@ def open_first(sym, direction, score, atr, price):
     pos = get_pos(sym)
     if not pos: return
     
-    # Ortalama maliyet üzerinden ilk stop seviyesi
     sl = pos["entry"] - direction * SL_ATR * atr
     
     with state_lock:
@@ -244,7 +244,7 @@ def manage(sym):
             state[sym] = st
         place_stop(sym, pos["side"], pos["amt"], st["sl"])
 
-    # Stop-loss kontrolü (Güncel ortalama maliyet üzerinden)
+    # Stop-loss kontrolü
     if (price - st["sl"]) * d <= 0: 
         return close_all(sym, "stop")
     
@@ -252,22 +252,21 @@ def manage(sym):
     if score * d <= -MIN_SCORE: 
         return close_all(sym, "ters sinyal")
     
-    # Gerçek ortalama maliyete göre kâr hesaplama
     avg_entry = pos["entry"]
     profit = (price - avg_entry) * d
     
-    # TP1 Kontrolü (%50 Kısmi Satış)
+    # TP1 Kontrolü (Hedef kar görüldüğü an sinyal beklemeden kısmi kar al)[span_1](start_span)[span_1](end_span)
     if not st["tp1"] and profit >= TP1_ATR * st["atr"]:
         if close_part(sym, pos, 0.5, "TP1"):
             st["tp1"] = True
-            # TP1 alındıktan sonra stop'u maliyetin hafif üstüne (kârda kapatmak için) çek
+            # Stop seviyesini giriş maliyetinin üstüne çekerek işlemi garantile (Risk Sıfırlama)
             st["sl"] = avg_entry + d * 0.1 * st["atr"]
             pos = get_pos(sym)
             if pos:
                 place_stop(sym, pos["side"], pos["amt"], st["sl"])
         return
         
-    # TP2 Kontrolü (%50 Kısmi Satış - Kalanın yarısı)
+    # TP2 Kontrolü (Kalanın karını büyütme)
     if st["tp1"] and not st["tp2"] and profit >= TP2_ATR * st["atr"]:
         if close_part(sym, pos, 0.5, "TP2"):
             st["tp2"] = True
@@ -276,7 +275,7 @@ def manage(sym):
                 place_stop(sym, pos["side"], pos["amt"], st["sl"])
         return
         
-    # Trailing Stop Mekanizması (TP1 olduktan sonra fiyatı takip eder)
+    # Trailing Stop Mekanizması (Fiyat lehimize gittikçe karı arkadan takip edip kilitleme)
     if st["tp1"]:
         new_sl = price - d * TRAIL_ATR * st["atr"]
         if (new_sl - st["sl"]) * d > 0:
@@ -314,7 +313,7 @@ def bot_loop():
                 state = {}
                 
     start_bal = balance()
-    log.info(f"Bot basladi (3'te 2 Kuralı Aktif) | bakiye={start_bal:.2f} USDT")
+    log.info(f"Bot basladi (Çevik Kar Al & İzleyen Stop Aktif) | bakiye={start_bal:.2f} USDT")
     
     while True:
         try:
@@ -344,7 +343,7 @@ def home():
         bal = balance()
         with state_lock:
             keys = list(state.keys())
-        return f"BOT CANLI BABAM! (3'te 2 İndikatör Modu) | Bakiye: {bal} USDT | Pozisyonlar: {keys} | Proxy: OK"
+        return f"BOT CANLI BABAM! (Çevik Mod + Trailing Stop) | Bakiye: {bal} USDT | Pozisyonlar: {keys} | Proxy: OK"
     except Exception as e:
         return f"Bot ayakta ama Binance hatasi: {e} | Proxy: {PROXY_URL}"
 
