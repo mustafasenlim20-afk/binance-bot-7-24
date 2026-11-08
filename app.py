@@ -4,7 +4,7 @@ Binance USDT-M Futures botu (7/24, 3'te 2 İndikatör Filtresi, long + short) - 
 - Proxy destekli
 - Flask ile 7/24 ayakta
 - Rate-limit korumalı ve Ortalama Maliyet Düzeltmeli
-- ROI Bazlı Kâr Al (Take Profit) ve İzleyen Stop (Trailing Stop) Mekanizmalı
+- ROI Bazlı Kâr Al (Take Profit - Güncellenmiş %30) ve İzleyen Stop (Trailing Stop) Mekanizmalı
 """
 import os
 import json
@@ -27,7 +27,7 @@ TRANCHES = 3
 ADD_ATR = 1.0
 MAX_OPEN = 3
 SL_ATR = 1.5
-TP1_ROI = 50.0      # ROI %50 olduğunda ilk kâr al (%50 satış)
+TP1_ROI = 30.0      # GÜNCELLENDİ: ROI %30 olduğunda ilk kâr al (%50 satış ve riski sıfırlama)
 TP2_ROI = 100.0     # ROI %100 olduğunda ikinci kâr al (kalanın %50'si)
 TRAIL_ATR = 1.0     # İzleyen stop mesafesi
 MAX_DRAWDOWN = 0.20
@@ -258,9 +258,9 @@ def manage(sym):
     roi_pct = ((price - avg_entry) * d / avg_entry) * st["lev"] * 100
     log.info(f"{sym} Anlık ROI: %{roi_pct:.2f}")
     
-    # TP1 Kontrolü (ROI %50'yi geçtiği an yarısını satıp karı ayırır)[span_0](start_span)[span_0](end_span)
+    # TP1 Kontrolü (ROI %30'u geçtiği an yarısını satıp karı ayırır ve riski sıfırlar)
     if not st["tp1"] and roi_pct >= TP1_ROI:
-        if close_part(sym, pos, 0.5, "TP1 (%50 ROI)"):
+        if close_part(sym, pos, 0.5, "TP1 (%30 ROI)"):
             st["tp1"] = True
             # Stop seviyesini giriş maliyetinin çok az üstüne çekerek riski sıfırla
             st["sl"] = avg_entry + d * 0.001 * avg_entry
@@ -316,7 +316,7 @@ def bot_loop():
                 state = {}
                 
     start_bal = balance()
-    log.info(f"Bot basladi (ROI Bazlı Kâr Al Aktif) | bakiye={start_bal:.2f} USDT")
+    log.info(f"Bot basladi (ROI %30 Kâr Al Modu Aktif) | bakiye={start_bal:.2f} USDT")
     
     while True:
         try:
@@ -346,7 +346,7 @@ def home():
         bal = balance()
         with state_lock:
             keys = list(state.keys())
-        return f"BOT CANLI BABAM! (ROI Kâr Al Modu) | Bakiye: {bal} USDT | Pozisyonlar: {keys} | Proxy: OK"
+        return f"BOT CANLI BABAM! (%30 ROI Kâr Al Modu) | Bakiye: {bal} USDT | Pozisyonlar: {keys} | Proxy: OK"
     except Exception as e:
         return f"Bot ayakta ama Binance hatasi: {e} | Proxy: {PROXY_URL}"
 
