@@ -4,7 +4,7 @@ Binance USDT-M Futures botu (7/24, 3'te 2 İndikatör Filtresi, long + short) - 
 - Proxy destekli
 - Flask ile 7/24 ayakta
 - Rate-limit korumalı ve Ortalama Maliyet Düzeltmeli
-- Kar Al (Take Profit) ve İzleyen Stop (Trailing Stop) Mekanizmalı
+- ROI Bazlı Kâr Al (Take Profit) ve İzleyen Stop (Trailing Stop) Mekanizmalı
 """
 import os
 import json
@@ -27,8 +27,8 @@ TRANCHES = 3
 ADD_ATR = 1.0
 MAX_OPEN = 3
 SL_ATR = 1.5
-TP1_ATR = 1.2       # Kar al seviyesi daha hızlı realize olması için optimize edildi
-TP2_ATR = 2.5
+TP1_ROI = 50.0      # ROI %50 olduğunda ilk kâr al (%50 satış)
+TP2_ROI = 100.0     # ROI %100 olduğunda ikinci kâr al (kalanın %50'si)
 TRAIL_ATR = 1.0     # İzleyen stop mesafesi
 MAX_DRAWDOWN = 0.20
 STATE_FILE = "bot_state.json"
@@ -253,22 +253,25 @@ def manage(sym):
         return close_all(sym, "ters sinyal")
     
     avg_entry = pos["entry"]
-    profit = (price - avg_entry) * d
     
-    # TP1 Kontrolü (Hedef kar görüldüğü an sinyal beklemeden kısmi kar al)[span_1](start_span)[span_1](end_span)
-    if not st["tp1"] and profit >= TP1_ATR * st["atr"]:
-        if close_part(sym, pos, 0.5, "TP1"):
+    # Binance ekranındaki ROI oranını tam hesapla (Kaldıraç dahil yüzdelik kâr)
+    roi_pct = ((price - avg_entry) * d / avg_entry) * st["lev"] * 100
+    log.info(f"{sym} Anlık ROI: %{roi_pct:.2f}")
+    
+    # TP1 Kontrolü (ROI %50'yi geçtiği an yarısını satıp karı ayırır)[span_0](start_span)[span_0](end_span)
+    if not st["tp1"] and roi_pct >= TP1_ROI:
+        if close_part(sym, pos, 0.5, "TP1 (%50 ROI)"):
             st["tp1"] = True
-            # Stop seviyesini giriş maliyetinin üstüne çekerek işlemi garantile (Risk Sıfırlama)
-            st["sl"] = avg_entry + d * 0.1 * st["atr"]
+            # Stop seviyesini giriş maliyetinin çok az üstüne çekerek riski sıfırla
+            st["sl"] = avg_entry + d * 0.001 * avg_entry
             pos = get_pos(sym)
             if pos:
                 place_stop(sym, pos["side"], pos["amt"], st["sl"])
         return
         
-    # TP2 Kontrolü (Kalanın karını büyütme)
-    if st["tp1"] and not st["tp2"] and profit >= TP2_ATR * st["atr"]:
-        if close_part(sym, pos, 0.5, "TP2"):
+    # TP2 Kontrolü (ROI %100 olduğunda kalan yarısı için)
+    if st["tp1"] and not st["tp2"] and roi_pct >= TP2_ROI:
+        if close_part(sym, pos, 0.5, "TP2 (%100 ROI)"):
             st["tp2"] = True
             pos = get_pos(sym)
             if pos:
@@ -313,7 +316,7 @@ def bot_loop():
                 state = {}
                 
     start_bal = balance()
-    log.info(f"Bot basladi (Çevik Kar Al & İzleyen Stop Aktif) | bakiye={start_bal:.2f} USDT")
+    log.info(f"Bot basladi (ROI Bazlı Kâr Al Aktif) | bakiye={start_bal:.2f} USDT")
     
     while True:
         try:
@@ -343,7 +346,7 @@ def home():
         bal = balance()
         with state_lock:
             keys = list(state.keys())
-        return f"BOT CANLI BABAM! (Çevik Mod + Trailing Stop) | Bakiye: {bal} USDT | Pozisyonlar: {keys} | Proxy: OK"
+        return f"BOT CANLI BABAM! (ROI Kâr Al Modu) | Bakiye: {bal} USDT | Pozisyonlar: {keys} | Proxy: OK"
     except Exception as e:
         return f"Bot ayakta ama Binance hatasi: {e} | Proxy: {PROXY_URL}"
 
