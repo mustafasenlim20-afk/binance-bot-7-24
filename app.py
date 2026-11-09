@@ -6,7 +6,6 @@ import json
 import time
 import logging
 import threading
-import requests
 import ccxt
 import pandas as pd
 from flask import Flask, jsonify
@@ -161,3 +160,164 @@ def place_stop(sym, side, amt, price):
     cancel_orders(sym)
     close_side = "sell" if side == "long" else "buy"
     ex.create_order(sym, "STOP_MARKET", close_side, float(ex.amount_to_precision(sym, amt)), None, {"stopPrice": float(ex.price_to_precision(sym, price)), "reduceOnly": True})
+    print(f"{sym} stop -> {price:.6f}")
+
+def market_order(sym, side, qty, reduce=False):
+    params = {"reduceOnly": True} if reduce else {}
+    return ex.create_order(sym, "market", side, qty, None, params)
+
+def close_all(sym, why):
+    cancel_orders(sym)
+    pos = get_pos(sym)
+    if pos:
+        side = "sell" if pos["side"] == "long" else "buy"
+        market_order(sym, side, pos["amt"], reduce=True)
+        print(f"{sym} KAPATILDI ({why})")
+    with state_lock:
+        state.pop(sym, None)
+
+def close_part(sym, pos, fraction, why):
+    qty = float(ex.amount_to_precision(sym, pos["amt"] * fraction))
+    if qty <= 0 or qty >= pos["amt"]:
+        close_all(sym, why)
+        return False
+    side = "sell" if pos["side"] == "long" else "buy"
+    market_order(sym, side, qty, reduce=True)
+    print(f"{sym} kismi satis {fraction:.0%} ({why})")
+    return True
+
+def open_first(sym, direction, score, atr, price):
+    lev = LEV_BY_SCORE.get(min(abs(score), 3), 5)
+    try: ex.set_margin_mode("isolated", sym)
+    except: pass
+    try: ex.set_leverage(lev, sym)
+    except: pass
+        
+    qty = tranche_qty(sym, price, lev)
+    if qty <= 0: return
+    market_order(sym, "buy" if direction == 1 else "sell", qty)
+    pos = get_pos(sym)
+    if not pos: return
+    
+    sl = pos["entry"] - direction * SL_ATR * atr
+    
+    with state_lock:
+        state[sym] = {
+            "tranches": 1, 
+            "last_add": pos["entry"], 
+            "atr": atr, 
+            "sl": sl, 
+            "tp1": False, 
+            "tp2": False, 
+            "lev": lev
+        }
+    
+    place_stop(sym, pos["side"], pos["amt"], sl)
+    print(f">>> {sym} {'LONG' if direction == 1 else 'SHORT'} ACILDI! (Skor: {score}) <<<")
+
+def manage(sym):
+    score, atr = get_signal(sym)
+    price = float(ex.fetch_ticker(sym)["last"])
+    pos = get_pos(sym)
+    
+    print(f"Taraniyor -> {sym} | Fiyat: {price} | Skor: {score}/3")
+    
+    with state_lock:
+        is_in_state = sym in state
+        st = state.get(sym)
+
+    if not pos:
+        if is_in_state:
+            with state_lock:
+                state.pop(sym, None)
+            cancel_orders(sym)
+        
+        with state_lock:
+            active_count = len(state)
+        
+        if active_count >= MAX_OPEN: return
+        if score >= MIN_SCORE: open_first(sym, 1, score, atr, price)
+        elif score <= -MIN_SCORE: open_first(sym, -1, score, atr, price)
+        return
+
+    d = 1 if pos["side"] == "long" else -1
+    
+    if st is None:
+        st = {
+            "tranches": 1, 
+            "last_add": pos["entry"], 
+            "atr": atr, 
+            "sl": pos["entry"] - d * SL_ATR * atr, 
+            "tp1": False, 
+            "tp2": False, 
+            "lev": 5
+        }
+        with state_lock:
+            state[sym] = st
+        place_stop(sym, pos["side"], pos["amt"], st["sl"])
+
+    if (price - st["sl"]) * d <= 0: 
+        return close_all(sym, "stop")
+    
+    if score * d <= -MIN_SCORE: 
+        return close_all(sym, "ters sinyal")
+    
+    avg_entry = pos["entry"]
+    roi_pct = ((price - avg_entry) * d / avg_entry) * st["lev"] * 100
+    print(f"{sym} Anlık ROI: %{roi_pct:.2f}")
+    
+    # 1. TP1 Kontrolü
+    if not st["tp1"] and roi_pct >= TP1_ROI:
+        if close_part(sym, pos, 0.5, "TP1 (%30 ROI)"):
+            st["tp1"] = True
+            st["sl"] = avg_entry + d * 0.001 * avg_entry
+            pos = get_pos(sym)
+            if pos:
+                place_stop(sym, pos["side"], pos["amt"], st["sl"])
+        
+    # 2. TP2 Kontrolü
+    if st["tp1"] and not st["tp2"] and roi_pct >= TP2_ROI:
+        if close_part(sym, pos, 0.5, "TP2 (%100 ROI)"):
+            st["tp2"] = True
+            pos = get_pos(sym)
+            if pos:
+                place_stop(sym, pos["side"], pos["amt"], st["sl"])
+        
+    # 3. Trailing Stop Güncellemesi
+    if st["tp1"]:
+        new_sl = price - d * TRAIL_ATR * st["atr"]
+        if (new_sl - st["sl"]) * d > 0:
+            st["sl"] = new_sl
+            pos = get_pos(sym)
+            if pos:
+                place_stop(sym, pos["side"], pos["amt"], st["sl"])
+        
+    # 4. Kademe Ekleme (Pyramiding) Kontrolü
+    if (st["tranches"] < TRANCHES and score * d >= MIN_SCORE and (price - st["last_add"]) * d >= ADD_ATR * st["atr"]):
+        qty = tranche_qty(sym, price, st["lev"])
+        if qty > 0:
+            market_order(sym, "buy" if d == 1 else "sell", qty)
+            st["tranches"] += 1
+            st["last_add"] = price
+            pos = get_pos(sym)
+            if pos:
+                place_stop(sym, pos["side"], pos["amt"], st["sl"])
+
+def save_state():
+    with state_lock:
+        with open(STATE_FILE, "w") as f: json.dump(state, f)
+
+def bot_loop():
+    global state
+    print("Bot döngüsü başlatılıyor...")
+    
+    while True:
+        try:
+            ex.load_markets()
+            if os.path.exists(STATE_FILE):
+                try:
+                    with open(STATE_FILE) as f:
+                        with state_lock:
+                            state = json.load(f)
+                except:
+                    with
