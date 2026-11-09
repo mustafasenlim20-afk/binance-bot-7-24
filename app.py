@@ -1,5 +1,10 @@
 """
-Binance USDT-M Futures botu (7/24, 3'te 2 İndikatör Filtresi, long + short) - RENDER UYUMLU (Kesin Çözüm)
+Binance USDT-M Futures botu (7/24, 3'te 2 İndikatör Filtresi, long + short) - RENDER UYUMLU (Ağ Korumalı)
+- BTC/ETH gibi pahalı coinleri eler, ADA/XRP/DOGE gibi altcoinlere odaklanır
+- Proxy destekli
+- Flask ile 7/24 ayakta
+- Rate-limit korumalı, Ortalama Maliyet Düzeltmeli ve NetworkError Korumalı
+- ROI Bazlı Kâr Al (Take Profit - %30) ve İzleyen Stop (Trailing Stop) Mekanizmalı
 """
 import os
 import json
@@ -14,7 +19,7 @@ app = Flask(__name__)
 
 # ===================== AYARLAR =====================
 TIMEFRAME = "5m"
-LOOP_SECONDS = 180      # Süreyi biraz kısalttık ki hızlı dönsün (3 dk)
+LOOP_SECONDS = 180      # Döngü süresi (3 dakika)
 MIN_SCORE = 2           
 LEV_BY_SCORE = {2: 5, 3: 8} 
 MARGIN_PCT = 0.30
@@ -300,23 +305,32 @@ def save_state():
 def bot_loop():
     global state
     print("Bot döngüsü başlatılıyor...")
-    try:
-        ex.load_markets()
-    except Exception as e:
-        print(f"Markets yükleme hatası: {e}")
-        
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE) as f:
-                with state_lock:
-                    state = json.load(f)
-        except:
-            with state_lock:
-                state = {}
-                
-    start_bal = balance()
-    print(f"Bot aktif! Başlangıç bakiyesi: {start_bal:.2f} USDT")
     
+    while True:
+        try:
+            try:
+                ex.load_markets()
+            except Exception as e:
+                print(f"Markets yükleme uyarısı (tekrar denenecek): {e}")
+                time.sleep(10)
+                continue
+
+            if os.path.exists(STATE_FILE):
+                try:
+                    with open(STATE_FILE) as f:
+                        with state_lock:
+                            state = json.load(f)
+                except:
+                    with state_lock:
+                        state = {}
+                        
+            start_bal = balance()
+            print(f"Bot aktif! Başlangıç bakiyesi: {start_bal:.2f} USDT")
+            break
+        except Exception as e:
+            print(f"Bağlantı hatası, 10 saniye sonra tekrar denenecek: {e}")
+            time.sleep(10)
+
     while True:
         try:
             if balance() < start_bal * (1 - MAX_DRAWDOWN):
@@ -335,6 +349,9 @@ def bot_loop():
                 except Exception as e: 
                     print(f"{sym} yönetim hatası: {e}")
             save_state()
+        except ccxt.NetworkError as ne:
+            print(f"Ağ bağlantı hatası (tekrar denenecek): {ne}")
+            time.sleep(15)
         except Exception as e: 
             print(f"Döngü genel hatası: {e}")
         time.sleep(LOOP_SECONDS)
