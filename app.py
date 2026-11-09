@@ -70,20 +70,14 @@ state_lock = threading.Lock()
 def get_dynamic_symbols():
     """20M - 800M hacim aralığındaki ve 500 USDT altındaki altcoinleri seçer (Futures)"""
     try:
-        # Futures piyasası için public veriyi zorla
-        tickers = ex.public_fapi_v1_get_ticker_24hr()
+        # CCXT'nin standart fetch_tickers() metodunu kullanarak tüm ticker verilerini çekiyoruz
+        tickers = ex.fetch_tickers()
         valid_tickers = {}
         
-        for data in tickers:
-            symbol_raw = data.get('symbol', '') # Örn: BTCUSDT
-            if symbol_raw.endswith('USDT'):
-                # CCXT formatına çevir (BTC/USDT:USDT)
-                base = symbol_raw[:-4]
-                if base in ['USDC', 'BUSD', 'FDUSD', 'TUSD']:
-                    continue
-                
-                symbol = f"{base}/USDT:USDT"
-                last_price = float(data.get('lastPrice') or 0)
+        for symbol, data in tickers.items():
+            # Sadece USDT vadeli işlem paritelerini al (Örn: BTC/USDT:USDT veya BTC/USDT)
+            if 'USDT' in symbol and not any(stable in symbol for stable in ['USDC', 'BUSD', 'FDUSD', 'TUSD']):
+                last_price = float(data.get('last') or data.get('close') or 0)
                 vol = float(data.get('quoteVolume') or 0)
                 
                 # Fiyat ve Güncel Hacim Aralığı Filtresi
