@@ -305,7 +305,8 @@ def manage(sym):
 
 def save_state():
     with state_lock:
-        with open(STATE_FILE, "w") as f: json.dump(state, f)
+        with open(STATE_FILE, "w") as f: 
+            json.dump(state, f)
 
 def bot_loop():
     global state
@@ -319,5 +320,34 @@ def bot_loop():
                     with open(STATE_FILE) as f:
                         with state_lock:
                             state = json.load(f)
-                except:
-                    with
+                except Exception as e:
+                    print(f"State yükleme hatası: {e}")
+            
+            symbols = get_dynamic_symbols()
+            for sym in symbols:
+                try:
+                    manage(sym)
+                except Exception as e:
+                    print(f"{sym} yönetilirken hata oluştu: {e}")
+                time.sleep(1)
+                
+            save_state()
+        except Exception as e:
+            print(f"Bot döngüsü genel hata: {e}")
+            
+        time.sleep(LOOP_SECONDS)
+
+@app.route("/")
+def index():
+    with state_lock:
+        return jsonify({
+            "status": "Bot çalışıyor",
+            "active_positions": state
+        })
+
+if __name__ == "__main__":
+    t = threading.Thread(target=bot_loop, daemon=True)
+    t.start()
+    
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
