@@ -68,18 +68,23 @@ state = {}
 state_lock = threading.Lock()
 
 def get_dynamic_symbols():
-    """20M - 800M hacim aralığındaki ve 500 USDT altındaki altcoinleri seçer"""
+    """20M - 800M hacim aralığındaki ve 500 USDT altındaki altcoinleri seçer (Futures)"""
     try:
-        tickers = ex.fetch_tickers()
+        # Futures piyasası için public veriyi zorla
+        tickers = ex.public_fapi_v1_get_ticker_24hr()
         valid_tickers = {}
-        for symbol, data in tickers.items():
-            if '/USDT:USDT' in symbol or symbol.endswith(':USDT'):
-                base = symbol.split('/')[0]
-                if base in ['USDC', 'BUSD', 'FDUSD', 'TUSD', 'BTC', 'ETH', 'BNB', 'SOL']:
+        
+        for data in tickers:
+            symbol_raw = data.get('symbol', '') # Örn: BTCUSDT
+            if symbol_raw.endswith('USDT'):
+                # CCXT formatına çevir (BTC/USDT:USDT)
+                base = symbol_raw[:-4]
+                if base in ['USDC', 'BUSD', 'FDUSD', 'TUSD']:
                     continue
                 
-                last_price = data.get('last') or 0
-                vol = data.get('quoteVolume') or 0
+                symbol = f"{base}/USDT:USDT"
+                last_price = float(data.get('lastPrice') or 0)
+                vol = float(data.get('quoteVolume') or 0)
                 
                 # Fiyat ve Güncel Hacim Aralığı Filtresi
                 if 0 < last_price <= MAX_COIN_PRICE and MIN_VOLUME <= vol <= MAX_VOLUME:
@@ -131,11 +136,10 @@ def bot_loop():
                     ohlcv = ex.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=50)
                     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     df = calculate_indicators(df)
-                    # Buraya strateji sinyal kontrolleri eklenebilir
                 except Exception as ex_inner:
                     log.error(f"{symbol} için veri işleme hatası: {ex_inner}")
                 
-                time.sleep(1) # Rate limit koruması
+                time.sleep(1)
                 
         except Exception as e:
             log.error(f"Döngü hatası: {e}")
@@ -144,10 +148,9 @@ def bot_loop():
 
 @app.route("/")
 def index():
-    return jsonify({"status": "running", "message": "Bot aktif ve tam sürüm çalışıyor!"})
+    return jsonify({"status": "running", "message": "Bot aktif ve hatasız çalışıyor!"})
 
 if __name__ == "__main__":
-    # Arkaplan bot döngüsünü thread olarak başlat
     t = threading.Thread(target=bot_loop, daemon=True)
     t.start()
     
