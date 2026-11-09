@@ -1,5 +1,5 @@
 """
-Binance USDT-M Futures botu (7/24, 3'te 2 İndikatör Filtresi, long + short) - RENDER UYUMLU
+Binance USDT-M Futures botu (7/24, 3'te 2 İndikatör Filtresi, long + short) - RENDER UYUMLU (Düzeltilmiş)
 - BTC/ETH gibi pahalı coinleri eler, ADA/XRP/DOGE gibi altcoinlere odaklanır
 - Proxy destekli
 - Flask ile 7/24 ayakta
@@ -19,17 +19,17 @@ app = Flask(__name__)
 
 # ===================== AYARLAR =====================
 TIMEFRAME = "5m"        # Daha çevik ve hızlı tepki için 5 dakikalık periyot
-LOOP_SECONDS = 360  # Rate limit önlemi için döngü süresi
-MIN_SCORE = 2       # 3 indikatörden en az 2'si uyarsa işlem açar (3'te 2 kuralı)
+LOOP_SECONDS = 360      # Rate limit önlemi için döngü süresi
+MIN_SCORE = 2           # 3 indikatörden en az 2'si uyarsa işlem açar (3'te 2 kuralı)
 LEV_BY_SCORE = {2: 5, 3: 8} # Skora göre kaldıraç
 MARGIN_PCT = 0.30
 TRANCHES = 3
 ADD_ATR = 1.0
 MAX_OPEN = 3
 SL_ATR = 1.5
-TP1_ROI = 30.0      # GÜNCELLENDİ: ROI %30 olduğunda ilk kâr al (%50 satış ve riski sıfırlama)
-TP2_ROI = 100.0     # ROI %100 olduğunda ikinci kâr al (kalanın %50'si)
-TRAIL_ATR = 1.0     # İzleyen stop mesafesi
+TP1_ROI = 30.0          # ROI %30 olduğunda ilk kâr al (%50 satış ve riski sıfırlama)
+TP2_ROI = 100.0         # ROI %100 olduğunda ikinci kâr al (kalanın %50'si)
+TRAIL_ATR = 1.0         # İzleyen stop mesafesi
 MAX_DRAWDOWN = 0.20
 STATE_FILE = "bot_state.json"
 TESTNET = False
@@ -68,7 +68,7 @@ state = {}
 state_lock = threading.Lock()
 
 def get_dynamic_symbols():
-    """Binance piyasasındaki hacmi yüksek, ancak fiyatı 500 USDT'den ucuz olan altcoinleri seçer (ADA, XRP tarzı)"""
+    """Binance piyasasındaki hacmi yüksek, ancak fiyatı 500 USDT'den ucuz olan altcoinleri seçer"""
     try:
         tickers = ex.fetch_tickers()
         valid_tickers = {}
@@ -134,8 +134,11 @@ def get_pos(sym):
     for p in ex.fetch_positions([sym]):
         amt = float(p.get("contracts") or 0)
         if amt > 0:
+            side = p.get("side")
+            if not side:  # One-way mod desteği için contracts işaretine bakar
+                side = "long" if float(p.get("notional", 0)) > 0 else "short"
             return {
-                "side": p["side"], 
+                "side": side, 
                 "amt": amt, 
                 "entry": float(p["entryPrice"] if p.get("entryPrice") else 0)
             }
@@ -178,9 +181,16 @@ def close_part(sym, pos, fraction, why):
 
 def open_first(sym, direction, score, atr, price):
     lev = LEV_BY_SCORE.get(min(abs(score), 3), 5)
-    try: ex.set_margin_mode("isolated", sym)
-    except: pass
-    ex.set_leverage(lev, sym)
+    try:
+        ex.set_margin_mode("isolated", sym)
+    except Exception as e:
+        log.warning(f"{sym} marjin mod ayarlanamadı (zaten izole olabilir): {e}")
+        
+    try:
+        ex.set_leverage(lev, sym)
+    except Exception as e:
+        log.warning(f"{sym} kaldıraç ayarlanamadı: {e}")
+        
     qty = tranche_qty(sym, price, lev)
     if qty <= 0: return
     market_order(sym, "buy" if direction == 1 else "sell", qty)
@@ -254,22 +264,21 @@ def manage(sym):
     
     avg_entry = pos["entry"]
     
-    # Binance ekranındaki ROI oranını tam hesapla (Kaldıraç dahil yüzdelik kâr)
+    # ROI hesaplama
     roi_pct = ((price - avg_entry) * d / avg_entry) * st["lev"] * 100
     log.info(f"{sym} Anlık ROI: %{roi_pct:.2f}")
     
-    # TP1 Kontrolü (ROI %30'u geçtiği an yarısını satıp karı ayırır ve riski sıfırlar)
+    # TP1 Kontrolü (%30 ROI)
     if not st["tp1"] and roi_pct >= TP1_ROI:
         if close_part(sym, pos, 0.5, "TP1 (%30 ROI)"):
             st["tp1"] = True
-            # Stop seviyesini giriş maliyetinin çok az üstüne çekerek riski sıfırla
             st["sl"] = avg_entry + d * 0.001 * avg_entry
             pos = get_pos(sym)
             if pos:
                 place_stop(sym, pos["side"], pos["amt"], st["sl"])
         return
         
-    # TP2 Kontrolü (ROI %100 olduğunda kalan yarısı için)
+    # TP2 Kontrolü (%100 ROI)
     if st["tp1"] and not st["tp2"] and roi_pct >= TP2_ROI:
         if close_part(sym, pos, 0.5, "TP2 (%100 ROI)"):
             st["tp2"] = True
@@ -278,7 +287,7 @@ def manage(sym):
                 place_stop(sym, pos["side"], pos["amt"], st["sl"])
         return
         
-    # Trailing Stop Mekanizması (Fiyat lehimize gittikçe karı arkadan takip edip kilitleme)
+    # Trailing Stop
     if st["tp1"]:
         new_sl = price - d * TRAIL_ATR * st["atr"]
         if (new_sl - st["sl"]) * d > 0:
@@ -288,7 +297,7 @@ def manage(sym):
                 place_stop(sym, pos["side"], pos["amt"], st["sl"])
         return
         
-    # Kademeli Ekleme (DCA) Kontrolü
+    # DCA (Kademeli Ekleme) Kontrolü
     if (st["tranches"] < TRANCHES and score * d >= MIN_SCORE and (price - st["last_add"]) * d >= ADD_ATR * st["atr"]):
         qty = tranche_qty(sym, price, st["lev"])
         if qty > 0:
