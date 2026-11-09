@@ -89,7 +89,6 @@ def get_dynamic_symbols():
         top_symbols = sorted_symbols[:12]  # En uygun ilk 12 coin
         
         if not top_symbols:
-            # Eğer bu aralıkta o an coin bulunamazsa güvenli yedek liste
             top_symbols = ["XRP/USDT:USDT", "DOGE/USDT:USDT", "AVAX/USDT:USDT", "ADA/USDT:USDT", "LINK/USDT:USDT"]
             
         print(f"50M-700M Hacim Aralığında Seçilen Coinler: {top_symbols}")
@@ -267,6 +266,7 @@ def manage(sym):
     roi_pct = ((price - avg_entry) * d / avg_entry) * st["lev"] * 100
     print(f"{sym} Anlık ROI: %{roi_pct:.2f}")
     
+    # 1. TP1 Kontrolü (Hatalı return kaldırıldı)
     if not st["tp1"] and roi_pct >= TP1_ROI:
         if close_part(sym, pos, 0.5, "TP1 (%30 ROI)"):
             st["tp1"] = True
@@ -274,16 +274,16 @@ def manage(sym):
             pos = get_pos(sym)
             if pos:
                 place_stop(sym, pos["side"], pos["amt"], st["sl"])
-        return
         
+    # 2. TP2 Kontrolü
     if st["tp1"] and not st["tp2"] and roi_pct >= TP2_ROI:
         if close_part(sym, pos, 0.5, "TP2 (%100 ROI)"):
             st["tp2"] = True
             pos = get_pos(sym)
             if pos:
                 place_stop(sym, pos["side"], pos["amt"], st["sl"])
-        return
         
+    # 3. Trailing Stop Güncellemesi
     if st["tp1"]:
         new_sl = price - d * TRAIL_ATR * st["atr"]
         if (new_sl - st["sl"]) * d > 0:
@@ -291,8 +291,8 @@ def manage(sym):
             pos = get_pos(sym)
             if pos:
                 place_stop(sym, pos["side"], pos["amt"], st["sl"])
-        return
         
+    # 4. Kademe Ekleme (Pyramiding) Kontrolü - Artık sorunsuz çalışacak
     if (st["tranches"] < TRANCHES and score * d >= MIN_SCORE and (price - st["last_add"]) * d >= ADD_ATR * st["atr"]):
         qty = tranche_qty(sym, price, st["lev"])
         if qty > 0:
