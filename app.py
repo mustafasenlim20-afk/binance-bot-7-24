@@ -87,3 +87,15 @@ def get_dynamic_symbols():
         
         sorted_symbols = sorted(valid_tickers.keys(), key=lambda x: valid_tickers[x], reverse=True)
         top_symbols = sorted_symbols[:12]
+        return top_symbols
+    except Exception as e:
+        log.error(f"Semboller çekilirken hata oluştu: {e}")
+        return []
+
+@app.route("/")
+def index():
+    return jsonify({"status": "running", "message": "Bot aktif ve çalışıyor!"})
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
