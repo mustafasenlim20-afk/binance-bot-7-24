@@ -87,3 +87,69 @@ def get_dynamic_symbols():
         
         sorted_symbols = sorted(valid_tickers.keys(), key=lambda x: valid_tickers[x], reverse=True)
         top_symbols = sorted_symbols[:12]
+        return top_symbols
+    except Exception as e:
+        log.error(f"Semboller çekilirken hata oluştu: {e}")
+        return []
+
+def calculate_indicators(df):
+    """Teknik indikatörleri hesaplar (EMA, RSI, ATR)"""
+    try:
+        df['ema_fast'] = df['close'].ewm(span=9, adjust=False).mean()
+        df['ema_slow'] = df['close'].ewm(span=21, adjust=False).mean()
+        
+        # RSI Hesaplama
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+        
+        # ATR Hesaplama
+        high_low = df['high'] - df['low']
+        high_close = (df['high'] - df['close'].shift()).abs()
+        low_close = (df['low'] - df['close'].shift()).abs()
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        true_range = ranges.max(axis=1)
+        df['atr'] = true_range.rolling(14).mean()
+        
+        return df
+    except Exception as e:
+        log.error(f"İndikatör hesaplama hatası: {e}")
+        return df
+
+def bot_loop():
+    """Botun 7/24 arkaplanda çalışacak ana döngüsü"""
+    log.log(logging.INFO, "Bot arkaplan döngüsü başladı.")
+    while True:
+        try:
+            symbols = get_dynamic_symbols()
+            log.info(f"Seçilen dinamik coinler: {symbols}")
+            
+            for symbol in symbols:
+                try:
+                    ohlcv = ex.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=50)
+                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df = calculate_indicators(df)
+                    # Buraya strateji sinyal kontrolleri eklenebilir
+                except Exception as ex_inner:
+                    log.error(f"{symbol} için veri işleme hatası: {ex_inner}")
+                
+                time.sleep(1) # Rate limit koruması
+                
+        except Exception as e:
+            log.error(f"Döngü hatası: {e}")
+            
+        time.sleep(LOOP_SECONDS)
+
+@app.route("/")
+def index():
+    return jsonify({"status": "running", "message": "Bot aktif ve tam sürüm çalışıyor!"})
+
+if __name__ == "__main__":
+    # Arkaplan bot döngüsünü thread olarak başlat
+    t = threading.Thread(target=bot_loop, daemon=True)
+    t.start()
+    
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
