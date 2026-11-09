@@ -1,10 +1,5 @@
 """
-Binance USDT-M Futures botu (7/24, 3'te 2 İndikatör Filtresi, long + short) - RENDER UYUMLU (Ağ Korumalı)
-- BTC/ETH gibi pahalı coinleri eler, ADA/XRP/DOGE gibi altcoinlere odaklanır
-- Proxy destekli
-- Flask ile 7/24 ayakta
-- Rate-limit korumalı, Ortalama Maliyet Düzeltmeli ve NetworkError Korumalı
-- ROI Bazlı Kâr Al (Take Profit - %30) ve İzleyen Stop (Trailing Stop) Mekanizmalı
+Binance USDT-M Futures botu (7/24, 3'te 2 İndikatör Filtresi) - DİNAMİK HACİM FİLTRELİ (%50M - 700M)
 """
 import os
 import json
@@ -34,9 +29,12 @@ MAX_DRAWDOWN = 0.20
 STATE_FILE = "bot_state.json"
 TESTNET = False
 MAX_COIN_PRICE = 500.0  
+
+# İstediğin Hacim Filtresi Aralıkları (USDT cinsinden)
+MIN_VOLUME = 50_000_000     # 50 Milyon USDT
+MAX_VOLUME = 700_000_000    # 700 Milyon USDT
 # ===================================================
 
-# Logların ekrana şakır şakır dökülmesi için ayar
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -70,24 +68,31 @@ state = {}
 state_lock = threading.Lock()
 
 def get_dynamic_symbols():
-    """Güvenli ve garantili altcoin seçici"""
+    """50M - 700M hacim aralığındaki ve 500 USDT altındaki altcoinleri seçer"""
     try:
         tickers = ex.fetch_tickers()
         valid_tickers = {}
         for symbol, data in tickers.items():
-            if 'USDT' in symbol and not 'UP/' in symbol and not 'DOWN/' in symbol:
+            if symbol.endswith(':USDT') and 'quoteVolume' in data:
                 base = symbol.split('/')[0]
                 if base in ['USDC', 'BUSD', 'FDUSD', 'TUSD', 'BTC', 'ETH', 'BNB', 'SOL']:
                     continue
                 
                 last_price = data.get('last') or 0
                 vol = data.get('quoteVolume') or 0
-                if 0 < last_price <= MAX_COIN_PRICE:
+                
+                # Fiyat ve Belirttiğin Hacim Aralığı Filtresi
+                if 0 < last_price <= MAX_COIN_PRICE and MIN_VOLUME <= vol <= MAX_VOLUME:
                     valid_tickers[symbol] = vol
         
         sorted_symbols = sorted(valid_tickers.keys(), key=lambda x: valid_tickers[x], reverse=True)
-        top_symbols = sorted_symbols[:10]
-        print(f"Dinamik seçilen en hacimli altcoinler: {top_symbols}")
+        top_symbols = sorted_symbols[:12]  # En uygun ilk 12 coin
+        
+        if not top_symbols:
+            # Eğer bu aralıkta o an coin bulunamazsa güvenli yedek liste
+            top_symbols = ["XRP/USDT:USDT", "DOGE/USDT:USDT", "AVAX/USDT:USDT", "ADA/USDT:USDT", "LINK/USDT:USDT"]
+            
+        print(f"50M-700M Hacim Aralığında Seçilen Coinler: {top_symbols}")
         return top_symbols
     except Exception as e:
         print(f"Dinamik coin seçme hatası: {e}")
@@ -120,7 +125,7 @@ def tranche_qty(sym, price, lev):
     return qty
 
 def get_signal(sym):
-    raw = ex.fetch_ohlcv(sym, TIMEFRAME, limit=200)
+    raw = ex.fetch_ohlcv(sym, TIMEFRAME, limit=100)
     df = pd.DataFrame(raw, columns=["t", "open", "high", "low", "close", "volume"])
     df = add_indicators(df)
     r, p = df.iloc[-2], df.iloc[-3]
@@ -308,13 +313,7 @@ def bot_loop():
     
     while True:
         try:
-            try:
-                ex.load_markets()
-            except Exception as e:
-                print(f"Markets yükleme uyarısı (tekrar denenecek): {e}")
-                time.sleep(10)
-                continue
-
+            ex.load_markets()
             if os.path.exists(STATE_FILE):
                 try:
                     with open(STATE_FILE) as f:
@@ -353,7 +352,7 @@ def bot_loop():
             print(f"Ağ bağlantı hatası (tekrar denenecek): {ne}")
             time.sleep(15)
         except Exception as e: 
-            print(f"Döngü genel hatası: {e}")
+                    print(f"Döngü genel hatası: {e}")
         time.sleep(LOOP_SECONDS)
 
 @app.route('/')
@@ -362,7 +361,7 @@ def home():
         bal = balance()
         with state_lock:
             keys = list(state.keys())
-        return f"BOT CANLI BABAM! | Bakiye: {bal} USDT | Pozisyonlar: {keys}"
+        return f"BOT CANLI BABAM! (50M-700M Hacim Filtreli) | Bakiye: {bal} USDT | Pozisyonlar: {keys}"
     except Exception as e:
         return f"Bot ayakta ama hata: {e}"
 
