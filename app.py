@@ -1,10 +1,5 @@
 """
-Binance USDT-M Futures botu (7/24, 3'te 2 İndikatör Filtresi, long + short) - RENDER UYUMLU (Düzeltilmiş)
-- BTC/ETH gibi pahalı coinleri eler, ADA/XRP/DOGE gibi altcoinlere odaklanır
-- Proxy destekli
-- Flask ile 7/24 ayakta
-- Rate-limit korumalı ve Ortalama Maliyet Düzeltmeli
-- ROI Bazlı Kâr Al (Take Profit - Güncellenmiş %30) ve İzleyen Stop (Trailing Stop) Mekanizmalı
+Binance USDT-M Futures botu (7/24, 3'te 2 İndikatör Filtresi, long + short) - RENDER UYUMLU (Kesin Çözüm)
 """
 import os
 import json
@@ -18,28 +13,30 @@ from flask import Flask, jsonify
 app = Flask(__name__)
 
 # ===================== AYARLAR =====================
-TIMEFRAME = "5m"        # Daha çevik ve hızlı tepki için 5 dakikalık periyot
-LOOP_SECONDS = 360      # Rate limit önlemi için döngü süresi
-MIN_SCORE = 2           # 3 indikatörden en az 2'si uyarsa işlem açar (3'te 2 kuralı)
-LEV_BY_SCORE = {2: 5, 3: 8} # Skora göre kaldıraç
+TIMEFRAME = "5m"
+LOOP_SECONDS = 180      # Süreyi biraz kısalttık ki hızlı dönsün (3 dk)
+MIN_SCORE = 2           
+LEV_BY_SCORE = {2: 5, 3: 8} 
 MARGIN_PCT = 0.30
 TRANCHES = 3
 ADD_ATR = 1.0
 MAX_OPEN = 3
 SL_ATR = 1.5
-TP1_ROI = 30.0          # ROI %30 olduğunda ilk kâr al (%50 satış ve riski sıfırlama)
-TP2_ROI = 100.0         # ROI %100 olduğunda ikinci kâr al (kalanın %50'si)
-TRAIL_ATR = 1.0         # İzleyen stop mesafesi
+TP1_ROI = 30.0          
+TP2_ROI = 100.0     
+TRAIL_ATR = 1.0     
 MAX_DRAWDOWN = 0.20
 STATE_FILE = "bot_state.json"
 TESTNET = False
-MAX_COIN_PRICE = 500.0  # BTC ve ETH gibi pahalı coinleri elemek için üst fiyat sınırı (USDT)
+MAX_COIN_PRICE = 500.0  
 # ===================================================
 
+# Logların ekrana şakır şakır dökülmesi için ayar
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("bot.log", encoding="utf-8")],
+    handlers=[logging.StreamHandler()],
+    force=True
 )
 log = logging.getLogger("bot")
 
@@ -68,26 +65,27 @@ state = {}
 state_lock = threading.Lock()
 
 def get_dynamic_symbols():
-    """Binance piyasasındaki hacmi yüksek, ancak fiyatı 500 USDT'den ucuz olan altcoinleri seçer"""
+    """Güvenli ve garantili altcoin seçici"""
     try:
         tickers = ex.fetch_tickers()
         valid_tickers = {}
         for symbol, data in tickers.items():
-            if symbol.endswith(':USDT') and 'quoteVolume' in data:
+            if 'USDT' in symbol and not 'UP/' in symbol and not 'DOWN/' in symbol:
                 base = symbol.split('/')[0]
                 if base in ['USDC', 'BUSD', 'FDUSD', 'TUSD', 'BTC', 'ETH', 'BNB', 'SOL']:
                     continue
                 
                 last_price = data.get('last') or 0
+                vol = data.get('quoteVolume') or 0
                 if 0 < last_price <= MAX_COIN_PRICE:
-                    valid_tickers[symbol] = data['quoteVolume'] or 0
+                    valid_tickers[symbol] = vol
         
         sorted_symbols = sorted(valid_tickers.keys(), key=lambda x: valid_tickers[x], reverse=True)
         top_symbols = sorted_symbols[:10]
-        log.info(f"Dinamik seçilen en hacimli altcoinler: {top_symbols}")
+        print(f"Dinamik seçilen en hacimli altcoinler: {top_symbols}")
         return top_symbols
     except Exception as e:
-        log.error(f"Dinamik coin seçme hatası: {e}")
+        print(f"Dinamik coin seçme hatası: {e}")
         return ["XRP/USDT:USDT", "DOGE/USDT:USDT", "AVAX/USDT:USDT", "ADA/USDT:USDT", "LINK/USDT:USDT"]
 
 def add_indicators(df):
@@ -135,7 +133,7 @@ def get_pos(sym):
         amt = float(p.get("contracts") or 0)
         if amt > 0:
             side = p.get("side")
-            if not side:  # One-way mod desteği için contracts işaretine bakar
+            if not side:
                 side = "long" if float(p.get("notional", 0)) > 0 else "short"
             return {
                 "side": side, 
@@ -153,7 +151,7 @@ def place_stop(sym, side, amt, price):
     cancel_orders(sym)
     close_side = "sell" if side == "long" else "buy"
     ex.create_order(sym, "STOP_MARKET", close_side, float(ex.amount_to_precision(sym, amt)), None, {"stopPrice": float(ex.price_to_precision(sym, price)), "reduceOnly": True})
-    log.info(f"{sym} stop -> {price:.6f}")
+    print(f"{sym} stop -> {price:.6f}")
 
 def market_order(sym, side, qty, reduce=False):
     params = {"reduceOnly": True} if reduce else {}
@@ -165,7 +163,7 @@ def close_all(sym, why):
     if pos:
         side = "sell" if pos["side"] == "long" else "buy"
         market_order(sym, side, pos["amt"], reduce=True)
-        log.info(f"{sym} KAPATILDI ({why})")
+        print(f"{sym} KAPATILDI ({why})")
     with state_lock:
         state.pop(sym, None)
 
@@ -176,20 +174,15 @@ def close_part(sym, pos, fraction, why):
         return False
     side = "sell" if pos["side"] == "long" else "buy"
     market_order(sym, side, qty, reduce=True)
-    log.info(f"{sym} kismi satis {fraction:.0%} ({why})")
+    print(f"{sym} kismi satis {fraction:.0%} ({why})")
     return True
 
 def open_first(sym, direction, score, atr, price):
     lev = LEV_BY_SCORE.get(min(abs(score), 3), 5)
-    try:
-        ex.set_margin_mode("isolated", sym)
-    except Exception as e:
-        log.warning(f"{sym} marjin mod ayarlanamadı (zaten izole olabilir): {e}")
-        
-    try:
-        ex.set_leverage(lev, sym)
-    except Exception as e:
-        log.warning(f"{sym} kaldıraç ayarlanamadı: {e}")
+    try: ex.set_margin_mode("isolated", sym)
+    except: pass
+    try: ex.set_leverage(lev, sym)
+    except: pass
         
     qty = tranche_qty(sym, price, lev)
     if qty <= 0: return
@@ -211,14 +204,14 @@ def open_first(sym, direction, score, atr, price):
         }
     
     place_stop(sym, pos["side"], pos["amt"], sl)
-    log.info(f"{sym} {'LONG' if direction == 1 else 'SHORT'} acildi (Skor: {score})")
+    print(f">>> {sym} {'LONG' if direction == 1 else 'SHORT'} ACILDI! (Skor: {score}) <<<")
 
 def manage(sym):
     score, atr = get_signal(sym)
     price = float(ex.fetch_ticker(sym)["last"])
     pos = get_pos(sym)
     
-    log.info(f"Tarama -> {sym} | Fiyat: {price} | Skor: {score}/3")
+    print(f"Taraniyor -> {sym} | Fiyat: {price} | Skor: {score}/3")
     
     with state_lock:
         is_in_state = sym in state
@@ -254,21 +247,16 @@ def manage(sym):
             state[sym] = st
         place_stop(sym, pos["side"], pos["amt"], st["sl"])
 
-    # Stop-loss kontrolü
     if (price - st["sl"]) * d <= 0: 
         return close_all(sym, "stop")
     
-    # Ters sinyal kontrolü
     if score * d <= -MIN_SCORE: 
         return close_all(sym, "ters sinyal")
     
     avg_entry = pos["entry"]
-    
-    # ROI hesaplama
     roi_pct = ((price - avg_entry) * d / avg_entry) * st["lev"] * 100
-    log.info(f"{sym} Anlık ROI: %{roi_pct:.2f}")
+    print(f"{sym} Anlık ROI: %{roi_pct:.2f}")
     
-    # TP1 Kontrolü (%30 ROI)
     if not st["tp1"] and roi_pct >= TP1_ROI:
         if close_part(sym, pos, 0.5, "TP1 (%30 ROI)"):
             st["tp1"] = True
@@ -278,7 +266,6 @@ def manage(sym):
                 place_stop(sym, pos["side"], pos["amt"], st["sl"])
         return
         
-    # TP2 Kontrolü (%100 ROI)
     if st["tp1"] and not st["tp2"] and roi_pct >= TP2_ROI:
         if close_part(sym, pos, 0.5, "TP2 (%100 ROI)"):
             st["tp2"] = True
@@ -287,7 +274,6 @@ def manage(sym):
                 place_stop(sym, pos["side"], pos["amt"], st["sl"])
         return
         
-    # Trailing Stop
     if st["tp1"]:
         new_sl = price - d * TRAIL_ATR * st["atr"]
         if (new_sl - st["sl"]) * d > 0:
@@ -297,7 +283,6 @@ def manage(sym):
                 place_stop(sym, pos["side"], pos["amt"], st["sl"])
         return
         
-    # DCA (Kademeli Ekleme) Kontrolü
     if (st["tranches"] < TRANCHES and score * d >= MIN_SCORE and (price - st["last_add"]) * d >= ADD_ATR * st["atr"]):
         qty = tranche_qty(sym, price, st["lev"])
         if qty > 0:
@@ -314,7 +299,12 @@ def save_state():
 
 def bot_loop():
     global state
-    ex.load_markets()
+    print("Bot döngüsü başlatılıyor...")
+    try:
+        ex.load_markets()
+    except Exception as e:
+        print(f"Markets yükleme hatası: {e}")
+        
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f:
@@ -325,7 +315,7 @@ def bot_loop():
                 state = {}
                 
     start_bal = balance()
-    log.info(f"Bot basladi (ROI %30 Kâr Al Modu Aktif) | bakiye={start_bal:.2f} USDT")
+    print(f"Bot aktif! Başlangıç bakiyesi: {start_bal:.2f} USDT")
     
     while True:
         try:
@@ -341,12 +331,12 @@ def bot_loop():
             for sym in current_symbols:
                 try:
                     manage(sym)
-                    time.sleep(1.5)
+                    time.sleep(1.0)
                 except Exception as e: 
-                    log.error(f"{sym} hata: {e}")
+                    print(f"{sym} yönetim hatası: {e}")
             save_state()
         except Exception as e: 
-            log.error(f"Dongu hatasi: {e}")
+            print(f"Döngü genel hatası: {e}")
         time.sleep(LOOP_SECONDS)
 
 @app.route('/')
@@ -355,14 +345,9 @@ def home():
         bal = balance()
         with state_lock:
             keys = list(state.keys())
-        return f"BOT CANLI BABAM! (%30 ROI Kâr Al Modu) | Bakiye: {bal} USDT | Pozisyonlar: {keys} | Proxy: OK"
+        return f"BOT CANLI BABAM! | Bakiye: {bal} USDT | Pozisyonlar: {keys}"
     except Exception as e:
-        return f"Bot ayakta ama Binance hatasi: {e} | Proxy: {PROXY_URL}"
-
-@app.route('/ip')
-def get_ip():
-    import requests
-    return jsonify({"ip": requests.get('https://api.ipify.org').text})
+        return f"Bot ayakta ama hata: {e}"
 
 threading.Thread(target=bot_loop, daemon=True).start()
 
