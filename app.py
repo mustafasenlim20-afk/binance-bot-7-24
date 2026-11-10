@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures botu (7/24, 3'te 2 İndikatör Filtresi) - DİNAMİK HACİM FİLTRELİ (20M - 800M)
-Direct Requests Versiyonu (CCXT Arka Plan Engellerinden Arındırılmış)
+Direct Requests Versiyonu (Tip Kontrollü Sağlamlaştırılmış)
 """
 import os
 import time
@@ -46,7 +46,6 @@ log = logging.getLogger("bot")
 PROXY_URL = os.getenv("PROXY_URL")
 print(f"Proxy kontrol: {PROXY_URL}")
 
-# Emirler (alım-satım, kaldıraç, bakiye) için CCXT dursun ama market çekme işini requests ile yapacağız
 exchange_config = {
     "apiKey": os.getenv("BINANCE_API_KEY"),
     "secret": os.getenv("BINANCE_API_SECRET"),
@@ -73,22 +72,31 @@ state = {}
 state_lock = threading.Lock()
 
 def get_dynamic_symbols():
-    """Doğrudan Binance REST API (requests) kullanarak exchangeInfo'ya takılmadan coinleri seçer"""
+    """Gelen verinin tipini kontrol ederek güvenli şekilde coinleri seçer"""
     try:
         url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
         response = requests.get(url, timeout=15)
         data = response.json()
         
+        # Eğer gelen veri liste değilse (örn: hata mesajı string döndüyse) patlamayı önle
+        if not isinstance(data, list):
+            log.error(f"Binance'den beklenmeyen veri formatı geldi: {data}")
+            return []
+        
         valid_tickers = {}
         for item in data:
+            if not isinstance(item, dict):
+                continue
+                
             symbol = item.get('symbol', '')
             if 'USDT' in symbol and not any(stable in symbol for stable in ['USDC', 'BUSD', 'FDUSD', 'TUSD']):
-                last_price = float(item.get('lastPrice', 0))
-                vol = float(item.get('quoteVolume', 0))
+                try:
+                    last_price = float(item.get('lastPrice', 0))
+                    vol = float(item.get('quoteVolume', 0))
+                except (ValueError, TypeError):
+                    continue
                 
-                # Fiyat ve Güncel Hacim Aralığı Filtresi
                 if 0 < last_price <= MAX_COIN_PRICE and MIN_VOLUME <= vol <= MAX_VOLUME:
-                    # CCXT formatına uyumlu hale getir (örn: BTCUSDT -> BTC/USDT:USDT)
                     if symbol.endswith('USDT'):
                         base = symbol[:-4]
                         formatted_symbol = f"{base}/USDT:USDT"
@@ -215,7 +223,7 @@ def bot_loop():
 
 @app.route("/")
 def index():
-    return jsonify({"status": "running", "message": "Bot doğrudan requests ile çalışıyor ve hatasız!"})
+    return jsonify({"status": "running", "message": "Bot sağlamlaştırılmış requests ile çalışıyor!"})
 
 if __name__ == "__main__":
     t = threading.Thread(target=bot_loop, daemon=True)
