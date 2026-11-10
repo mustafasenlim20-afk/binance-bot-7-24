@@ -74,18 +74,15 @@ state_lock = threading.Lock()
 def get_dynamic_symbols():
     """20M - 800M hacim aralığındaki ve 500 USDT altındaki altcoinleri seçer (Futures)"""
     try:
-        # fetchCurrencies kapalı olduğu için burası sadece Futures market verisini çeker
         ex.load_markets()
         tickers = ex.fetch_tickers()
         valid_tickers = {}
         
         for symbol, data in tickers.items():
-            # Sadece USDT vadeli işlem paritelerini al
             if 'USDT' in symbol and not any(stable in symbol for stable in ['USDC', 'BUSD', 'FDUSD', 'TUSD']):
                 last_price = float(data.get('last') or data.get('close') or 0)
                 vol = float(data.get('quoteVolume') or 0)
                 
-                # Fiyat ve Güncel Hacim Aralığı Filtresi
                 if 0 < last_price <= MAX_COIN_PRICE and MIN_VOLUME <= vol <= MAX_VOLUME:
                     valid_tickers[symbol] = vol
         
@@ -122,21 +119,92 @@ def calculate_indicators(df):
         log.error(f"İndikatör hesaplama hatası: {e}")
         return df
 
+def check_signals(df):
+    """Basit 3'te 2 indikatör filtre matrisi (Örnek Mantık)"""
+    if len(df) < 2:
+        return 0, "HOLD"
+    
+    last = df.iloc[-1]
+    score = 0
+    signal = "HOLD"
+    
+    # Şart 1: EMA Kesişimi
+    if last['ema_fast'] > last['ema_slow']:
+        score += 1
+    
+    # Şart 2: RSI Filtresi (45 - 65 arası yükseliş trendi)
+    if 45 <= last['rsi'] <= 65:
+        score += 1
+        
+    # Şart 3: Fiyat EMA Fast üstünde mi?
+    if last['close'] > last['ema_fast']:
+        score += 1
+
+    if score >= MIN_SCORE:
+        signal = "BUY"
+        
+    return score, signal
+
 def bot_loop():
-    """Botun 7/24 arkaplanda çalışacak ana döngüsü"""
+    """Botun 7/24 arkaplanda çalışacak ana döngüsü ve işlem yöneticisi"""
     log.info("Bot arkaplan döngüsü başladı.")
     while True:
         try:
             symbols = get_dynamic_symbols()
             log.info(f"Seçilen dinamik coinler: {symbols}")
             
+            # Açık pozisyon sayısını kontrol et
+            try:
+                positions = ex.fetch_positions()
+                open_positions = [p for p in positions if float(p.get('contracts', 0)) > 0]
+            except Exception as pos_err:
+                log.error(f"Pozisyonlar çekilemedi: {pos_err}")
+                open_positions = []
+
             for symbol in symbols:
+                if len(open_positions) >= MAX_OPEN:
+                    break
+                    
+                # Zaten açık pozisyon varsa tekrar açma
+                if any(p['symbol'] == symbol for p in open_positions):
+                    continue
+
                 try:
                     ohlcv = ex.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=50)
                     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     df = calculate_indicators(df)
+                    
+                    score, signal = check_signals(df)
+                    log.info(f"{symbol} | Skor: {score} | Sinyal: {signal}")
+
+                    if signal == "BUY":
+                        # Kaldıraç ayarla
+                        lev = LEV_BY_SCORE.get(score, 5)
+                        try:
+                            ex.set_leverage(lev, symbol)
+                        except Exception:
+                            pass
+
+                        # Bakiye kontrolü ve emir tutarı hesaplama
+                        balance = ex.fetch_balance()
+                        usdt_free = float(balance['USDT']['free'])
+                        margin_to_use = usdt_free * MARGIN_PCT
+                        
+                        last_price = df.iloc[-1]['close']
+                        notional = margin_to_use * lev
+                        amount = notional / last_price
+
+                        # Minimum miktar kontrolü (Market emri ile alım)
+                        market = ex.market(symbol)
+                        amount = float(ex.amount_to_precision(symbol, amount))
+                        
+                        if amount > 0:
+                            order = ex.create_market_buy_order(symbol, amount)
+                            log.info(f"🚀 İŞLEM AÇILDI: {symbol} | Miktar: {amount} | Kaldıraç: {lev}x")
+                            time.sleep(2)
+                            
                 except Exception as inner_err:
-                    log.error(f"{symbol} için veri işleme hatası: {inner_err}")
+                    log.error(f"{symbol} işlem hatası: {inner_err}")
                 
                 time.sleep(1)
                 
@@ -147,7 +215,7 @@ def bot_loop():
 
 @app.route("/")
 def index():
-    return jsonify({"status": "running", "message": "Bot aktif ve hatasız çalışıyor!"})
+    return jsonify({"status": "running", "message": "Bot aktif ve işlemler çalışıyor!"})
 
 if __name__ == "__main__":
     t = threading.Thread(target=bot_loop, daemon=True)
