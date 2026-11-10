@@ -27,10 +27,9 @@ TP2_ROI = 100.0
 TRAIL_ATR = 1.0     
 MAX_DRAWDOWN = 0.20
 STATE_FILE = "bot_state.json"
-TESTNET = False
+TESTNET = False         # Render IP engeli sürerse True yapıp test edebilirsin
 MAX_COIN_PRICE = 500.0  
 
-# Güncellenen Hacim Filtresi Aralıkları (USDT cinsinden)
 MIN_VOLUME = 20_000_000     # 20 Milyon USDT
 MAX_VOLUME = 800_000_000    # 800 Milyon USDT
 # ===================================================
@@ -50,7 +49,7 @@ exchange_config = {
     "apiKey": os.getenv("BINANCE_API_KEY"),
     "secret": os.getenv("BINANCE_API_SECRET"),
     "enableRateLimit": True,
-    "timeout": 30000,  # Timeout süresini 30 saniyeye çıkararak kopmaları önler
+    "timeout": 40000,  # Timeout süresi uzatıldı
     "options": {
         "adjustForTimeDifference": True,
         "defaultType": "future",
@@ -73,10 +72,10 @@ state = {}
 state_lock = threading.Lock()
 
 def get_dynamic_symbols():
-    """20M - 800M hacim aralığındaki ve 500 USDT altındaki altcoinleri seçer (Güvenli Bağlantı)"""
-    for attempt in range(3): # Bağlantı kopmalarına karşı 3 kez deneme yapar
+    """Alternatif endpoint ve güvenli bağlantı ile coinleri seçer"""
+    for attempt in range(4):
         try:
-            ex.load_markets(reload=True)
+            # exchangeInfo yerine doğrudan public ticker verisini çekerek engeli aşmaya çalışır
             tickers = ex.fetch_tickers()
             valid_tickers = {}
             
@@ -93,14 +92,13 @@ def get_dynamic_symbols():
             if top_symbols:
                 return top_symbols
         except Exception as e:
-            log.warning(f"Bağlantı denemesi {attempt+1} başarısız, tekrar deneniyor... Hata: {e}")
-            time.sleep(5)
+            log.warning(f"Bağlantı denemesi {attempt+1} hata aldı: {e}")
+            time.sleep(8)
             
-    log.error("Semboller çekilemedi!")
+    log.error("Tüm denemelere rağmen semboller çekilemedi!")
     return []
 
 def calculate_indicators(df):
-    """Teknik indikatörleri hesaplar (EMA, RSI, ATR)"""
     try:
         df['ema_fast'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema_slow'] = df['close'].ewm(span=21, adjust=False).mean()
@@ -124,7 +122,6 @@ def calculate_indicators(df):
         return df
 
 def check_signals(df):
-    """3'te 2 indikatör filtre matrisi"""
     if len(df) < 2:
         return 0, "HOLD"
     
@@ -145,7 +142,6 @@ def check_signals(df):
     return score, signal
 
 def bot_loop():
-    """Botun 7/24 arkaplanda çalışacak ana döngüsü"""
     log.info("Bot arkaplan döngüsü başladı.")
     while True:
         try:
@@ -153,7 +149,7 @@ def bot_loop():
             log.info(f"Seçilen dinamik coinler: {symbols}")
             
             if not symbols:
-                log.warning("Coin listesi boş döndü, bekleniyor...")
+                log.warning("Coin listesi boş, 30 saniye sonra tekrar denenecek...")
                 time.sleep(30)
                 continue
 
@@ -213,7 +209,7 @@ def bot_loop():
 
 @app.route("/")
 def index():
-    return jsonify({"status": "running", "message": "Bot aktif ve stabil çalışıyor!"})
+    return jsonify({"status": "running", "message": "Bot aktif ve çalışıyor!"})
 
 if __name__ == "__main__":
     t = threading.Thread(target=bot_loop, daemon=True)
@@ -221,3 +217,4 @@ if __name__ == "__main__":
     
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+k
