@@ -1,11 +1,12 @@
 """
 Binance USDT-M Futures botu (7/24, 3'te 2 İndikatör Filtresi) - DİNAMİK HACİM FİLTRELİ (20M - 800M)
+Direct Requests Versiyonu (CCXT Arka Plan Engellerinden Arındırılmış)
 """
 import os
-import json
 import time
 import logging
 import threading
+import requests
 import ccxt
 import pandas as pd
 from flask import Flask, jsonify
@@ -27,7 +28,7 @@ TP2_ROI = 100.0
 TRAIL_ATR = 1.0     
 MAX_DRAWDOWN = 0.20
 STATE_FILE = "bot_state.json"
-TESTNET = False         # Render IP engeli sürerse True yapıp test edebilirsin
+TESTNET = False
 MAX_COIN_PRICE = 500.0  
 
 MIN_VOLUME = 20_000_000     # 20 Milyon USDT
@@ -45,15 +46,15 @@ log = logging.getLogger("bot")
 PROXY_URL = os.getenv("PROXY_URL")
 print(f"Proxy kontrol: {PROXY_URL}")
 
+# Emirler (alım-satım, kaldıraç, bakiye) için CCXT dursun ama market çekme işini requests ile yapacağız
 exchange_config = {
     "apiKey": os.getenv("BINANCE_API_KEY"),
     "secret": os.getenv("BINANCE_API_SECRET"),
     "enableRateLimit": True,
-    "timeout": 40000,  # Timeout süresi uzatıldı
+    "timeout": 30000,
     "options": {
         "adjustForTimeDifference": True,
         "defaultType": "future",
-        "fetchCurrencies": False,
     },
 }
 
@@ -72,33 +73,36 @@ state = {}
 state_lock = threading.Lock()
 
 def get_dynamic_symbols():
-    """Alternatif endpoint ve güvenli bağlantı ile coinleri seçer"""
-    for attempt in range(4):
-        try:
-            # exchangeInfo yerine doğrudan public ticker verisini çekerek engeli aşmaya çalışır
-            tickers = ex.fetch_tickers()
-            valid_tickers = {}
-            
-            for symbol, data in tickers.items():
-                if 'USDT' in symbol and not any(stable in symbol for stable in ['USDC', 'BUSD', 'FDUSD', 'TUSD']):
-                    last_price = float(data.get('last') or data.get('close') or 0)
-                    vol = float(data.get('quoteVolume') or 0)
-                    
-                    if 0 < last_price <= MAX_COIN_PRICE and MIN_VOLUME <= vol <= MAX_VOLUME:
-                        valid_tickers[symbol] = vol
-            
-            sorted_symbols = sorted(valid_tickers.keys(), key=lambda x: valid_tickers[x], reverse=True)
-            top_symbols = sorted_symbols[:12]
-            if top_symbols:
-                return top_symbols
-        except Exception as e:
-            log.warning(f"Bağlantı denemesi {attempt+1} hata aldı: {e}")
-            time.sleep(8)
-            
-    log.error("Tüm denemelere rağmen semboller çekilemedi!")
-    return []
+    """Doğrudan Binance REST API (requests) kullanarak exchangeInfo'ya takılmadan coinleri seçer"""
+    try:
+        url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+        response = requests.get(url, timeout=15)
+        data = response.json()
+        
+        valid_tickers = {}
+        for item in data:
+            symbol = item.get('symbol', '')
+            if 'USDT' in symbol and not any(stable in symbol for stable in ['USDC', 'BUSD', 'FDUSD', 'TUSD']):
+                last_price = float(item.get('lastPrice', 0))
+                vol = float(item.get('quoteVolume', 0))
+                
+                # Fiyat ve Güncel Hacim Aralığı Filtresi
+                if 0 < last_price <= MAX_COIN_PRICE and MIN_VOLUME <= vol <= MAX_VOLUME:
+                    # CCXT formatına uyumlu hale getir (örn: BTCUSDT -> BTC/USDT:USDT)
+                    if symbol.endswith('USDT'):
+                        base = symbol[:-4]
+                        formatted_symbol = f"{base}/USDT:USDT"
+                        valid_tickers[formatted_symbol] = vol
+                        
+        sorted_symbols = sorted(valid_tickers.keys(), key=lambda x: valid_tickers[x], reverse=True)
+        top_symbols = sorted_symbols[:12]
+        return top_symbols
+    except Exception as e:
+        log.error(f"Requests ile semboller çekilirken hata oluştu: {e}")
+        return []
 
 def calculate_indicators(df):
+    """Teknik indikatörleri hesaplar (EMA, RSI, ATR)"""
     try:
         df['ema_fast'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema_slow'] = df['close'].ewm(span=21, adjust=False).mean()
@@ -122,6 +126,7 @@ def calculate_indicators(df):
         return df
 
 def check_signals(df):
+    """3'te 2 indikatör filtre matrisi"""
     if len(df) < 2:
         return 0, "HOLD"
     
@@ -142,6 +147,7 @@ def check_signals(df):
     return score, signal
 
 def bot_loop():
+    """Botun 7/24 arkaplanda çalışacak ana döngüsü"""
     log.info("Bot arkaplan döngüsü başladı.")
     while True:
         try:
@@ -149,7 +155,7 @@ def bot_loop():
             log.info(f"Seçilen dinamik coinler: {symbols}")
             
             if not symbols:
-                log.warning("Coin listesi boş, 30 saniye sonra tekrar denenecek...")
+                log.warning("Coin listesi boş döndü, 30 saniye sonra tekrar deneniyor...")
                 time.sleep(30)
                 continue
 
@@ -209,7 +215,7 @@ def bot_loop():
 
 @app.route("/")
 def index():
-    return jsonify({"status": "running", "message": "Bot aktif ve çalışıyor!"})
+    return jsonify({"status": "running", "message": "Bot doğrudan requests ile çalışıyor ve hatasız!"})
 
 if __name__ == "__main__":
     t = threading.Thread(target=bot_loop, daemon=True)
@@ -217,4 +223,3 @@ if __name__ == "__main__":
     
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-k
