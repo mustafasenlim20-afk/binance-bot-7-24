@@ -50,7 +50,10 @@ exchange_config = {
     "apiKey": os.getenv("BINANCE_API_KEY"),
     "secret": os.getenv("BINANCE_API_SECRET"),
     "enableRateLimit": True,
-    "options": {"adjustForTimeDifference": True, "defaultType": "future"},
+    "options": {
+        "adjustForTimeDifference": True,  # Saat farkını otomatik kapatır
+        "defaultType": "future"
+    },
 }
 
 if PROXY_URL:
@@ -70,12 +73,13 @@ state_lock = threading.Lock()
 def get_dynamic_symbols():
     """20M - 800M hacim aralığındaki ve 500 USDT altındaki altcoinleri seçer (Futures)"""
     try:
-        # CCXT'nin standart fetch_tickers() metodunu kullanarak tüm ticker verilerini çekiyoruz
+        # Piyasa listesini güvenli şekilde yükle ve saat senkronizasyonunu tetikle
+        ex.load_markets()
         tickers = ex.fetch_tickers()
         valid_tickers = {}
         
         for symbol, data in tickers.items():
-            # Sadece USDT vadeli işlem paritelerini al (Örn: BTC/USDT:USDT veya BTC/USDT)
+            # Sadece USDT vadeli işlem paritelerini al
             if 'USDT' in symbol and not any(stable in symbol for stable in ['USDC', 'BUSD', 'FDUSD', 'TUSD']):
                 last_price = float(data.get('last') or data.get('close') or 0)
                 vol = float(data.get('quoteVolume') or 0)
@@ -119,7 +123,7 @@ def calculate_indicators(df):
 
 def bot_loop():
     """Botun 7/24 arkaplanda çalışacak ana döngüsü"""
-    log.log(logging.INFO, "Bot arkaplan döngüsü başladı.")
+    log.info("Bot arkaplan döngüsü başladı.")
     while True:
         try:
             symbols = get_dynamic_symbols()
@@ -130,8 +134,8 @@ def bot_loop():
                     ohlcv = ex.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=50)
                     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     df = calculate_indicators(df)
-                except Exception as ex_inner:
-                    log.error(f"{symbol} için veri işleme hatası: {ex_inner}")
+                except Exception as inner_err:
+                    log.error(f"{symbol} için veri işleme hatası: {inner_err}")
                 
                 time.sleep(1)
                 
