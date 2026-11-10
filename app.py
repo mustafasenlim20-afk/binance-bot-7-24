@@ -65,7 +65,7 @@ if TESTNET:
 def get_dynamic_symbols():
     try:
         url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
-        response = requests.get(url, timeout=15, proxies=PROXIES)
+        response = requests.get(url, timeout=15)
         data = response.json()
         if not isinstance(data, list):
             log.error(f"Beklenmeyen veri formati: {data}")
