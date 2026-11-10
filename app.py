@@ -52,7 +52,8 @@ exchange_config = {
     "enableRateLimit": True,
     "options": {
         "adjustForTimeDifference": True,  # Saat farkını otomatik kapatır
-        "defaultType": "future"
+        "defaultType": "future",
+        "fetchCurrencies": False,         # Spot/SAPI cüzdan endpoint'ine gitmesini engeller
     },
 }
 
@@ -73,7 +74,7 @@ state_lock = threading.Lock()
 def get_dynamic_symbols():
     """20M - 800M hacim aralığındaki ve 500 USDT altındaki altcoinleri seçer (Futures)"""
     try:
-        # Piyasa listesini güvenli şekilde yükle ve saat senkronizasyonunu tetikle
+        # fetchCurrencies kapalı olduğu için burası sadece Futures market verisini çeker
         ex.load_markets()
         tickers = ex.fetch_tickers()
         valid_tickers = {}
