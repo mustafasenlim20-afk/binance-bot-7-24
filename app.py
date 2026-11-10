@@ -1,8 +1,9 @@
 """
-Binance USDT-M Futures botu (7/24, 3'te 2 İndikatör Filtresi) - DİNAMİK HACİM FİLTRELİ (20M - 800M)
-Direct Requests Versiyonu (Tip Kontrollü Sağlamlaştırılmış)
+Binance USDT-M Futures botu (7/24, 3'te 2 Indikator Filtresi) - DINAMIK HACIM FILTRELI (20M - 800M)
+Versiyon: Stop-loss + ROI %20'de pozisyonun %30'u kapanir + sadece kapanmis mum
 """
 import os
+import json
 import time
 import logging
 import threading
@@ -15,36 +16,33 @@ app = Flask(__name__)
 
 # ===================== AYARLAR =====================
 TIMEFRAME = "5m"
-LOOP_SECONDS = 180      # Döngü süresi (3 dakika)
-MIN_SCORE = 2           
-LEV_BY_SCORE = {2: 5, 3: 8} 
+LOOP_SECONDS = 180
+MIN_SCORE = 2
+LEV_BY_SCORE = {2: 5, 3: 8}
 MARGIN_PCT = 0.30
-TRANCHES = 3
-ADD_ATR = 1.0
 MAX_OPEN = 3
-SL_ATR = 1.5
-TP1_ROI = 30.0          
-TP2_ROI = 100.0     
-TRAIL_ATR = 1.0     
-MAX_DRAWDOWN = 0.20
+SL_ATR = 1.5            # Stop-loss: giris - 1.5 x ATR
+TP1_ROI = 20.0          # ROI %20 olunca
+TP1_CLOSE_PCT = 0.30    # pozisyonun %30'unu kapat
+TRAIL_ATR = 1.5         # Gezen stop mesafesi: en yuksek fiyat - 1.5 x ATR
+TRAIL_CHECK_SECONDS = 20  # Gezen stop kac saniyede bir kontrol edilsin
 STATE_FILE = "bot_state.json"
 TESTNET = False
-MAX_COIN_PRICE = 500.0  
-
-MIN_VOLUME = 20_000_000     # 20 Milyon USDT
-MAX_VOLUME = 800_000_000    # 800 Milyon USDT
+MAX_COIN_PRICE = 500.0
+MIN_VOLUME = 20_000_000
+MAX_VOLUME = 800_000_000
 # ===================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler()],
-    force=True
+    force=True,
 )
 log = logging.getLogger("bot")
 
 PROXY_URL = os.getenv("PROXY_URL")
-print(f"Proxy kontrol: {PROXY_URL}")
+PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 
 exchange_config = {
     "apiKey": os.getenv("BINANCE_API_KEY"),
@@ -56,178 +54,308 @@ exchange_config = {
         "defaultType": "future",
     },
 }
-
 if PROXY_URL:
-    exchange_config["proxies"] = {
-        'http': PROXY_URL,
-        'https': PROXY_URL,
-    }
-    print("Proxy aktif babam!")
+    exchange_config["proxies"] = PROXIES
 
 ex = ccxt.binanceusdm(exchange_config)
 if TESTNET:
     ex.set_sandbox_mode(True)
 
-state = {}
-state_lock = threading.Lock()
 
 def get_dynamic_symbols():
-    """Gelen verinin tipini kontrol ederek güvenli şekilde coinleri seçer"""
     try:
         url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
-        response = requests.get(url, timeout=15)
+        response = requests.get(url, timeout=15, proxies=PROXIES)
         data = response.json()
-        
-        # Eğer gelen veri liste değilse (örn: hata mesajı string döndüyse) patlamayı önle
         if not isinstance(data, list):
-            log.error(f"Binance'den beklenmeyen veri formatı geldi: {data}")
+            log.error(f"Beklenmeyen veri formati: {data}")
             return []
-        
-        valid_tickers = {}
+
+        valid = {}
         for item in data:
             if not isinstance(item, dict):
                 continue
-                
-            symbol = item.get('symbol', '')
-            if 'USDT' in symbol and not any(stable in symbol for stable in ['USDC', 'BUSD', 'FDUSD', 'TUSD']):
-                try:
-                    last_price = float(item.get('lastPrice', 0))
-                    vol = float(item.get('quoteVolume', 0))
-                except (ValueError, TypeError):
-                    continue
-                
-                if 0 < last_price <= MAX_COIN_PRICE and MIN_VOLUME <= vol <= MAX_VOLUME:
-                    if symbol.endswith('USDT'):
-                        base = symbol[:-4]
-                        formatted_symbol = f"{base}/USDT:USDT"
-                        valid_tickers[formatted_symbol] = vol
-                        
-        sorted_symbols = sorted(valid_tickers.keys(), key=lambda x: valid_tickers[x], reverse=True)
-        top_symbols = sorted_symbols[:12]
-        return top_symbols
+            symbol = item.get("symbol", "")
+            if not symbol.endswith("USDT"):
+                continue
+            if any(s in symbol for s in ["USDC", "BUSD", "FDUSD", "TUSD"]):
+                continue
+            try:
+                price = float(item.get("lastPrice", 0))
+                vol = float(item.get("quoteVolume", 0))
+            except (ValueError, TypeError):
+                continue
+            if 0 < price <= MAX_COIN_PRICE and MIN_VOLUME <= vol <= MAX_VOLUME:
+                valid[f"{symbol[:-4]}/USDT:USDT"] = vol
+
+        return sorted(valid, key=valid.get, reverse=True)[:12]
     except Exception as e:
-        log.error(f"Requests ile semboller çekilirken hata oluştu: {e}")
+        log.error(f"Semboller cekilirken hata: {e}")
         return []
 
+
 def calculate_indicators(df):
-    """Teknik indikatörleri hesaplar (EMA, RSI, ATR)"""
-    try:
-        df['ema_fast'] = df['close'].ewm(span=9, adjust=False).mean()
-        df['ema_slow'] = df['close'].ewm(span=21, adjust=False).mean()
-        
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df['rsi'] = 100 - (100 / (1 + rs))
-        
-        high_low = df['high'] - df['low']
-        high_close = (df['high'] - df['close'].shift()).abs()
-        low_close = (df['low'] - df['close'].shift()).abs()
-        ranges = pd.concat([high_low, high_close, low_close], axis=1)
-        true_range = ranges.max(axis=1)
-        df['atr'] = true_range.rolling(14).mean()
-        
-        return df
-    except Exception as e:
-        log.error(f"İndikatör hesaplama hatası: {e}")
-        return df
+    df["ema_fast"] = df["close"].ewm(span=9, adjust=False).mean()
+    df["ema_slow"] = df["close"].ewm(span=21, adjust=False).mean()
+
+    delta = df["close"].diff()
+    gain = delta.where(delta > 0, 0).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    high_low = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift()).abs()
+    low_close = (df["low"] - df["close"].shift()).abs()
+    df["atr"] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(14).mean()
+    return df
+
 
 def check_signals(df):
-    """3'te 2 indikatör filtre matrisi"""
-    if len(df) < 2:
+    """Son KAPANMIS muma bakar (df'de acik mum yok)."""
+    if len(df) < 25:
         return 0, "HOLD"
-    
     last = df.iloc[-1]
+    if pd.isna(last["rsi"]) or pd.isna(last["atr"]):
+        return 0, "HOLD"
+
     score = 0
-    signal = "HOLD"
-    
-    if last['ema_fast'] > last['ema_slow']:
+    if last["ema_fast"] > last["ema_slow"]:
         score += 1
-    if 45 <= last['rsi'] <= 65:
+    if 45 <= last["rsi"] <= 65:
         score += 1
-    if last['close'] > last['ema_fast']:
+    if last["close"] > last["ema_fast"]:
         score += 1
 
-    if score >= MIN_SCORE:
-        signal = "BUY"
-        
-    return score, signal
+    return score, ("BUY" if score >= MIN_SCORE else "HOLD")
+
+
+def place_protection(symbol, entry, amount, atr, lev):
+    """Borsa tarafinda SL ve ROI %20 kismi kar alma emirlerini koyar.
+    SL konamazsa False doner (pozisyon kapatilmali)."""
+    sl_price = float(ex.price_to_precision(symbol, entry - SL_ATR * atr))
+    # ROI %20 = fiyat hareketi %20 / kaldirac
+    tp_price = float(ex.price_to_precision(symbol, entry * (1 + (TP1_ROI / 100) / lev)))
+    tp_amount = float(ex.amount_to_precision(symbol, amount * TP1_CLOSE_PCT))
+
+    try:
+        sl_order = ex.create_order(symbol, "STOP_MARKET", "sell", amount, None,
+                                   {"stopPrice": sl_price, "reduceOnly": True})
+        log.info(f"🛑 SL kondu: {symbol} @ {sl_price}")
+    except Exception as e:
+        log.error(f"{symbol} SL konamadi: {e}")
+        return None
+
+    if tp_amount > 0:
+        try:
+            ex.create_order(symbol, "TAKE_PROFIT_MARKET", "sell", tp_amount, None,
+                            {"stopPrice": tp_price, "reduceOnly": True})
+            log.info(f"🎯 TP kondu (%{TP1_CLOSE_PCT*100:.0f} kapanir): {symbol} @ {tp_price} (ROI %{TP1_ROI})")
+        except Exception as e:
+            log.error(f"{symbol} TP konamadi: {e}")
+    return {"sl_id": sl_order.get("id"), "sl_price": sl_price}
+
+
+# ---------------- GEZEN STOP (TRAILING) ----------------
+trail_state = {}
+trail_lock = threading.Lock()
+
+
+def save_state():
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(trail_state, f)
+    except Exception as e:
+        log.error(f"State kaydedilemedi: {e}")
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            trail_state.update(json.load(f))
+        log.info(f"State yuklendi: {list(trail_state.keys())}")
+    except Exception:
+        pass
+
+
+def cancel_safe(order_id, symbol):
+    """Normal ve kosullu emir iptalini dener."""
+    for params in ({}, {"trigger": True}):
+        try:
+            ex.cancel_order(order_id, symbol, params)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def cancel_all_safe(symbol):
+    for params in ({}, {"trigger": True}):
+        try:
+            ex.cancel_all_orders(symbol, params)
+        except Exception:
+            pass
+
+
+def trail_loop():
+    """Fiyat yukseldikce SL'yi yukari ceker, asla asagi indirmez."""
+    log.info("Gezen stop dongusu basladi.")
+    while True:
+        try:
+            with trail_lock:
+                symbols = list(trail_state.keys())
+
+            if symbols:
+                sizes = {p["symbol"]: float(p.get("contracts") or 0) for p in ex.fetch_positions()}
+
+                for symbol in symbols:
+                    try:
+                        st = trail_state.get(symbol)
+                        if not st:
+                            continue
+
+                        size = sizes.get(symbol, 0)
+                        if size <= 0:  # pozisyon kapandi, artan emirleri temizle
+                            cancel_all_safe(symbol)
+                            with trail_lock:
+                                trail_state.pop(symbol, None)
+                                save_state()
+                            log.info(f"{symbol} kapandi, gezen stop birakildi.")
+                            continue
+
+                        price = float(ex.fetch_ticker(symbol)["last"])
+                        st["high"] = max(st["high"], price)
+                        new_sl = float(ex.price_to_precision(symbol, st["high"] - TRAIL_ATR * st["atr"]))
+
+                        # Sadece yukari: en az 0.1 ATR fark olsun (gereksiz emir spami olmasin)
+                        if new_sl > st["sl_price"] + 0.1 * st["atr"] and new_sl < price:
+                            amount = float(ex.amount_to_precision(symbol, size))
+                            new_order = ex.create_order(symbol, "STOP_MARKET", "sell", amount, None,
+                                                        {"stopPrice": new_sl, "reduceOnly": True})
+                            cancel_safe(st["sl_id"], symbol)  # once yenisi kondu, sonra eskisi iptal
+                            log.info(f"📈 {symbol} gezen stop: {st['sl_price']} -> {new_sl}")
+                            st["sl_id"] = new_order.get("id")
+                            st["sl_price"] = new_sl
+
+                        with trail_lock:
+                            save_state()
+                    except Exception as e:
+                        log.error(f"{symbol} gezen stop hatasi: {e}")
+        except Exception as e:
+            log.error(f"Gezen stop dongu hatasi: {e}")
+
+        time.sleep(TRAIL_CHECK_SECONDS)
+
+
+def get_open_symbols():
+    positions = ex.fetch_positions()
+    return [p["symbol"] for p in positions if float(p.get("contracts") or 0) > 0]
+
 
 def bot_loop():
-    """Botun 7/24 arkaplanda çalışacak ana döngüsü"""
-    log.info("Bot arkaplan döngüsü başladı.")
+    log.info("Bot arkaplan dongusu basladi.")
     while True:
         try:
             symbols = get_dynamic_symbols()
-            log.info(f"Seçilen dinamik coinler: {symbols}")
-            
+            log.info(f"Secilen coinler: {symbols}")
             if not symbols:
-                log.warning("Coin listesi boş döndü, 30 saniye sonra tekrar deneniyor...")
                 time.sleep(30)
                 continue
 
             try:
-                positions = ex.fetch_positions()
-                open_positions = [p for p in positions if float(p.get('contracts', 0)) > 0]
-            except Exception as pos_err:
-                log.error(f"Pozisyonlar çekilemedi: {pos_err}")
-                open_positions = []
+                open_symbols = get_open_symbols()
+            except Exception as e:
+                log.error(f"Pozisyonlar cekilemedi: {e}")
+                time.sleep(30)
+                continue  # pozisyon bilgisi yoksa yeni islem acma
 
             for symbol in symbols:
-                if len(open_positions) >= MAX_OPEN:
+                if len(open_symbols) >= MAX_OPEN:
                     break
-                    
-                if any(p['symbol'] == symbol for p in open_positions):
+                if symbol in open_symbols:
                     continue
 
                 try:
-                    ohlcv = ex.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=50)
-                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    ohlcv = ex.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=60)
+                    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                    df = df.iloc[:-1].copy()  # acik mumu at
                     df = calculate_indicators(df)
-                    
+
                     score, signal = check_signals(df)
                     log.info(f"{symbol} | Skor: {score} | Sinyal: {signal}")
+                    if signal != "BUY":
+                        continue
 
-                    if signal == "BUY":
-                        lev = LEV_BY_SCORE.get(score, 5)
-                        try:
-                            ex.set_leverage(lev, symbol)
-                        except Exception:
-                            pass
+                    lev = LEV_BY_SCORE.get(score, 5)
+                    try:
+                        ex.set_margin_mode("isolated", symbol)
+                    except Exception:
+                        pass
+                    try:
+                        ex.set_leverage(lev, symbol)
+                    except Exception:
+                        pass
 
-                        balance = ex.fetch_balance()
-                        usdt_free = float(balance['USDT']['free'])
-                        margin_to_use = usdt_free * MARGIN_PCT
-                        
-                        last_price = df.iloc[-1]['close']
-                        notional = margin_to_use * lev
-                        amount = notional / last_price
+                    usdt_free = float(ex.fetch_balance()["USDT"]["free"])
+                    last = df.iloc[-1]
+                    amount = float(ex.amount_to_precision(symbol, usdt_free * MARGIN_PCT * lev / last["close"]))
+                    if amount <= 0:
+                        continue
 
-                        amount = float(ex.amount_to_precision(symbol, amount))
-                        
-                        if amount > 0:
-                            order = ex.create_market_buy_order(symbol, amount)
-                            log.info(f"🚀 İŞLEM AÇILDI: {symbol} | Miktar: {amount} | Kaldıraç: {lev}x")
-                            time.sleep(2)
-                            
+                    order = ex.create_market_buy_order(symbol, amount)
+                    entry = float(order.get("average") or order.get("price") or last["close"])
+                    log.info(f"🚀 ISLEM ACILDI: {symbol} | Miktar: {amount} | Kaldirac: {lev}x | Giris: {entry}")
+                    open_symbols.append(symbol)
+
+                    prot = place_protection(symbol, entry, amount, float(last["atr"]), lev)
+                    if prot:
+                        with trail_lock:
+                            trail_state[symbol] = {
+                                "atr": float(last["atr"]),
+                                "high": entry,
+                                "sl_price": prot["sl_price"],
+                                "sl_id": prot["sl_id"],
+                            }
+                            save_state()
+                    else:
+                        log.error(f"{symbol} SL yok, pozisyon aciliyor kapatiliyor!")
+                        ex.create_order(symbol, "market", "sell", amount, None, {"reduceOnly": True})
+                        open_symbols.remove(symbol)
+                    time.sleep(2)
+
                 except Exception as inner_err:
-                    log.error(f"{symbol} işlem hatası: {inner_err}")
-                
+                    log.error(f"{symbol} islem hatasi: {inner_err}")
+
                 time.sleep(1)
-                
+
         except Exception as e:
-            log.error(f"Döngü hatası: {e}")
-            
+            log.error(f"Dongu hatasi: {e}")
+
         time.sleep(LOOP_SECONDS)
+
+
+_started = False
+_start_lock = threading.Lock()
+
+
+def start_bot_once():
+    global _started
+    with _start_lock:
+        if not _started:
+            _started = True
+            load_state()
+            threading.Thread(target=bot_loop, daemon=True).start()
+            threading.Thread(target=trail_loop, daemon=True).start()
+
+
+start_bot_once()  # gunicorn ile de baslasin (1 worker kullan)
+
 
 @app.route("/")
 def index():
-    return jsonify({"status": "running", "message": "Bot sağlamlaştırılmış requests ile çalışıyor!"})
+    return jsonify({"status": "running"})
+
 
 if __name__ == "__main__":
-    t = threading.Thread(target=bot_loop, daemon=True)
-    t.start()
-    
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
