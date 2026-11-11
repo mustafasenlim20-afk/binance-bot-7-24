@@ -1,6 +1,10 @@
 """
-Binance USDT-M Futures botu (7/24, 3'te 2 Indikator Filtresi) - DINAMIK HACIM FILTRELI (20M - 800M)
-Versiyon: LONG + SHORT, Stop-loss, ROI %20'de pozisyonun %30'u kapanir, gezen stop, ban korumasi, sadece kapanmis mum
+Binance USDT-M Futures botu (7/24) - TREND PUANLAMALI TARAMA
+- 20M-800M hacim araligindaki TUM coinler taranir (12 coin siniri yok)
+- Her coin 0-100 trend puani alir, en yuksek puanli coin(ler)e girilir
+- ADX + hacim + EMA acilimi + kirilim + ust zaman dilimi uyumu ile sahte trendler elenir
+- LONG + SHORT, ATR stop-loss, kismi kar al, gezen stop, stop sonrasi bekleme, gunluk zarar limiti
+- Render'da yeniden baslarsa acik pozisyonlari sahiplenir (borsadaki stop'u bulup gezen stopu surdurur)
 """
 import os
 import re
@@ -16,26 +20,44 @@ from flask import Flask, jsonify
 app = Flask(__name__)
 
 # ===================== AYARLAR =====================
-TIMEFRAME = "5m"
-LOOP_SECONDS = 180
-MIN_SCORE = 2
-LEV_BY_SCORE = {2: 5, 3: 8}
-MARGIN_PCT = 0.30
+TIMEFRAME = "15m"          # ana zaman dilimi
+HTF = "1h"                 # ust zaman dilimi (yon teyidi)
+LOOP_SECONDS = 180         # tarama araligi
+
+# --- Coin secimi (HEPSI taranir) ---
+MIN_VOLUME = 20_000_000
+MAX_VOLUME = 800_000_000
+MAX_COIN_PRICE = 500.0
+
+# --- Trend puani (0-100) ---
+MIN_TREND_SCORE = 50       # bunun altindaki coine girilmez (dusurursen daha cok islem acar)
+STRONG_SCORE = 70          # bu puan ve ustu = guclu trend -> yuksek kaldirac
+HTF_CHECK_TOP = 10         # ust zaman dilimi teyidi en iyi kac coine yapilsin
+HTF_PTS = 15               # ust zaman dilimi uyumlu ise puan (belirsizse yarisi, ters ise elenir)
+ADX_MIN = 20               # bunun altinda trend yok sayilir
+MIN_ATR_PCT = 0.0025       # ATR / fiyat en az %0,25 (cok durgun coinde komisyon yer)
+MIN_REL_VOL = 0.7          # son 3 mum hacmi / onceki 20 mum ortalamasi en az bu olsun
+RSI_MAX_LONG = 75          # long'da RSI bunun ustundeyse trend yorulmus
+RSI_MIN_SHORT = 25         # short'ta RSI bunun altindaysa trend yorulmus
+MAX_EXT_ATR = 4.0          # fiyat EMA21'den 4 ATR'den fazla uzaksa gec kalinmis, girme
+BREAKOUT_BARS = 12         # kirilim icin bakilan onceki mum sayisi
+
+# --- Islem ---
+LEV_NORMAL = 3             # puan < STRONG_SCORE
+LEV_STRONG = 5             # puan >= STRONG_SCORE
+MARGIN_PCT = 0.30          # bos bakiyenin %30'u marjin
 MAX_OPEN = 3
-SL_ATR = 1.5            # Stop-loss: giris - 1.5 x ATR
-TP1_ROI = 20.0          # ROI %20 olunca
-TP1_CLOSE_PCT = 0.30    # pozisyonun %30'unu kapat
-TRAIL_ATR = 1.5         # Gezen stop mesafesi: en yuksek fiyat - 1.5 x ATR
-TRAIL_CHECK_SECONDS = 20  # Gezen stop kac saniyede bir kontrol edilsin
-LONG_RSI = (45, 65)     # Long icin RSI araligi
-SHORT_RSI = (35, 55)    # Short icin RSI araligi
+SL_ATR = 1.5               # Stop-loss: giris -/+ 1.5 x ATR
+TP1_ATR = 2.0              # Ilk kar al: giris +/- 2 x ATR
+TP1_CLOSE_PCT = 0.50       # ilk kar alda pozisyonun %50'si kapanir, kalan gezen stopla gider
+TRAIL_ATR = 1.5            # Gezen stop mesafesi (giristeki ATR x 1.5)
+TRAIL_CHECK_SECONDS = 20
+COOLDOWN_SECONDS = 2 * 3600   # bir coin kapaninca bu sure tekrar girilmez
+DAILY_LOSS_LIMIT_PCT = 10.0   # gun basi bakiyeye gore bu kadar zarar olursa gun sonuna kadar yeni islem yok
 ALLOW_LONG = True
 ALLOW_SHORT = True
 STATE_FILE = "bot_state.json"
 TESTNET = False
-MAX_COIN_PRICE = 500.0
-MIN_VOLUME = 20_000_000
-MAX_VOLUME = 800_000_000
 # ===================================================
 
 logging.basicConfig(
@@ -68,23 +90,22 @@ if TESTNET:
 
 
 # ---------------- BAN / HIZ KORUMASI ----------------
-ban_until = 0.0  # epoch saniye; bu zamana kadar Binance'e istek atilmaz
+ban_until = 0.0
 ban_lock = threading.Lock()
 
 
 def note_ban(err):
-    """Hata metninde Binance yasagi veya bolge engeli varsa bekleme suresini ayarlar.
-    Yasakliysa True doner."""
+    """Hata metninde Binance yasagi veya bolge engeli varsa bekleme suresini ayarlar."""
     global ban_until
     text = str(err)
     wait_until = 0.0
     m = re.search(r"banned until (\d{10,})", text)
     if m:
-        wait_until = int(m.group(1)) / 1000.0 + 15  # bitisten 15 sn sonra dene
+        wait_until = int(m.group(1)) / 1000.0 + 15
     elif "418" in text or "-1003" in text or "429" in text or "Too many requests" in text:
-        wait_until = time.time() + 120               # sure yoksa 2 dk bekle
+        wait_until = time.time() + 120
     elif "restricted location" in text or "451" in text:
-        wait_until = time.time() + 600               # bolge engeli: 10 dk bekle
+        wait_until = time.time() + 600
     if wait_until:
         with ban_lock:
             if wait_until > ban_until:
@@ -96,7 +117,6 @@ def note_ban(err):
 
 
 def wait_if_banned():
-    """Yasak suruyorsa bitene kadar uyur (en fazla 60 sn'lik parcalarla)."""
     while True:
         left = ban_until - time.time()
         if left <= 0:
@@ -104,10 +124,49 @@ def wait_if_banned():
         time.sleep(min(left, 60))
 
 
+# ---------------- DURUM (state) ----------------
+trail_state = {}      # sembol -> gezen stop bilgisi
+cooldown = {}         # sembol -> bekleme bitis zamani (epoch)
+day_state = {}        # {"day": "YYYY-MM-DD", "start": gun basi bakiye}
+trail_lock = threading.Lock()
+opening_symbols = set()   # su an acilmakta olan pozisyonlar (sahiplenme karismasin)
+open_lock = threading.Lock()
+
+
+def save_state():
+    """trail_lock icinde cagrilmali."""
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump({"trail": trail_state, "cooldown": cooldown, "day": day_state}, f)
+    except Exception as e:
+        log.error(f"State kaydedilemedi: {e}")
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            loaded = json.load(f)
+        if isinstance(loaded.get("trail"), dict):
+            trail = loaded["trail"]
+            cooldown.update({k: float(v) for k, v in loaded.get("cooldown", {}).items()})
+            day_state.update(loaded.get("day", {}))
+        else:
+            trail = loaded  # eski format
+        for st in trail.values():
+            st.setdefault("side", "long")
+            st.setdefault("ext", st.pop("high", st.get("sl_price", 0)))
+        trail_state.update(trail)
+        log.info(f"State yuklendi: {list(trail_state.keys())}")
+    except Exception:
+        pass
+
+
+# ---------------- COIN LISTESI ----------------
 def get_dynamic_symbols():
+    """20M-800M hacim araligindaki TUM USDT vadeli coinleri doner (hacme gore sirali)."""
     try:
         url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
-        response = requests.get(url, timeout=15)
+        response = requests.get(url, timeout=15, proxies=PROXIES)
         data = response.json()
         if not isinstance(data, list):
             log.error(f"Beklenmeyen veri formati: {data}")
@@ -131,10 +190,15 @@ def get_dynamic_symbols():
             if 0 < price <= MAX_COIN_PRICE and MIN_VOLUME <= vol <= MAX_VOLUME:
                 valid[f"{symbol[:-4]}/USDT:USDT"] = vol
 
-        return sorted(valid, key=valid.get, reverse=True)[:12]
+        return sorted(valid, key=valid.get, reverse=True)
     except Exception as e:
         log.error(f"Semboller cekilirken hata: {e}")
         return []
+
+
+# ---------------- INDIKATORLER ----------------
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
 
 
 def calculate_indicators(df):
@@ -142,62 +206,185 @@ def calculate_indicators(df):
     df["ema_slow"] = df["close"].ewm(span=21, adjust=False).mean()
 
     delta = df["close"].diff()
-    gain = delta.where(delta > 0, 0).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
     rs = gain / loss
     df["rsi"] = 100 - (100 / (1 + rs))
 
-    high_low = df["high"] - df["low"]
-    high_close = (df["high"] - df["close"].shift()).abs()
-    low_close = (df["low"] - df["close"].shift()).abs()
-    df["atr"] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(14).mean()
+    prev_close = df["close"].shift()
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    df["atr"] = tr.rolling(14).mean()
+
+    # ADX (Wilder)
+    up = df["high"].diff()
+    down = -df["low"].diff()
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
+    tr_s = tr.ewm(alpha=1 / 14, adjust=False).mean()
+    df["plus_di"] = 100 * plus_dm.ewm(alpha=1 / 14, adjust=False).mean() / tr_s
+    df["minus_di"] = 100 * minus_dm.ewm(alpha=1 / 14, adjust=False).mean() / tr_s
+    di_sum = (df["plus_di"] + df["minus_di"]).replace(0, float("nan"))
+    dx = 100 * (df["plus_di"] - df["minus_di"]).abs() / di_sum
+    df["adx"] = dx.ewm(alpha=1 / 14, adjust=False).mean()
     return df
 
 
-def check_signals(df):
-    """Son KAPANMIS muma bakar (df'de acik mum yok).
-    Doner: (skor, "BUY" | "SELL" | "HOLD"). BUY = long, SELL = short."""
-    if len(df) < 25:
-        return 0, "HOLD"
+def fetch_df(symbol, timeframe, limit=100):
+    """Kapanmis mumlari indikatorlerle birlikte doner (acik mum atilir)."""
+    ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = df.iloc[:-1].copy()
+    return calculate_indicators(df)
+
+
+# ---------------- TREND PUANLAMA ----------------
+def evaluate(df):
+    """Bir coini puanlar. Doner: (aday_dict | None, elenme_nedeni).
+    Puan (ust zaman dilimi haric en fazla 85):
+      ADX gucu 25 + ADX yukseliyor 10 + EMA acilimi 10 + goreceli hacim 20 + RSI 10 + kirilim 10
+    """
+    if len(df) < 60:
+        return None, "veri_az"
     last = df.iloc[-1]
-    if pd.isna(last["rsi"]) or pd.isna(last["atr"]):
-        return 0, "HOLD"
+    needed = ["adx", "rsi", "atr", "plus_di", "minus_di", "ema_fast", "ema_slow"]
+    if any(pd.isna(last[k]) for k in needed) or pd.isna(df["adx"].iloc[-4]):
+        return None, "veri_eksik"
 
-    long_score = 0
-    if last["ema_fast"] > last["ema_slow"]:
-        long_score += 1
-    if LONG_RSI[0] <= last["rsi"] <= LONG_RSI[1]:
-        long_score += 1
-    if last["close"] > last["ema_fast"]:
-        long_score += 1
+    close = float(last["close"])
+    atr = float(last["atr"])
+    adx = float(last["adx"])
+    rsi = float(last["rsi"])
+    if close <= 0 or atr <= 0:
+        return None, "veri_eksik"
 
-    short_score = 0
-    if last["ema_fast"] < last["ema_slow"]:
-        short_score += 1
-    if SHORT_RSI[0] <= last["rsi"] <= SHORT_RSI[1]:
-        short_score += 1
-    if last["close"] < last["ema_fast"]:
-        short_score += 1
+    # --- Sert filtreler (sahte trendleri eler) ---
+    if atr / close < MIN_ATR_PCT:
+        return None, "durgun"
+    if adx < ADX_MIN:
+        return None, "adx_dusuk"
 
-    if long_score >= MIN_SCORE and long_score > short_score:
-        return long_score, "BUY"
-    if short_score >= MIN_SCORE and short_score > long_score:
-        return short_score, "SELL"
-    return max(long_score, short_score), "HOLD"  # esitlik = belirsiz, islem yok
+    ef, es = float(last["ema_fast"]), float(last["ema_slow"])
+    if ef > es and last["plus_di"] > last["minus_di"] and close > es:
+        side = "long"
+    elif ef < es and last["minus_di"] > last["plus_di"] and close < es:
+        side = "short"
+    else:
+        return None, "yon_belirsiz"
+
+    if side == "long" and rsi > RSI_MAX_LONG:
+        return None, "rsi_asiri"
+    if side == "short" and rsi < RSI_MIN_SHORT:
+        return None, "rsi_asiri"
+    if abs(close - es) / atr > MAX_EXT_ATR:
+        return None, "gec_kalmis"
+
+    vol_recent = float(df["volume"].iloc[-3:].mean())
+    vol_base = float(df["volume"].iloc[-23:-3].mean())
+    rv = vol_recent / vol_base if vol_base > 0 else 0.0
+    if rv < MIN_REL_VOL:
+        return None, "hacim_dusuk"
+
+    # --- Puanlama ---
+    adx_pts = 25 * clamp((adx - ADX_MIN) / (40 - ADX_MIN), 0, 1)
+    rising_pts = 10 if adx > float(df["adx"].iloc[-4]) else 0
+    spread_pts = 10 * clamp(abs(ef - es) / atr, 0, 1)
+    vol_pts = 20 * clamp((rv - 0.8) / 1.2, 0, 1)
+    if side == "long":
+        rsi_pts = 10 if 50 <= rsi <= 68 else (5 if 45 <= rsi <= RSI_MAX_LONG else 0)
+        breakout = close > float(df["high"].iloc[-1 - BREAKOUT_BARS:-1].max())
+    else:
+        rsi_pts = 10 if 32 <= rsi <= 50 else (5 if RSI_MIN_SHORT <= rsi <= 55 else 0)
+        breakout = close < float(df["low"].iloc[-1 - BREAKOUT_BARS:-1].min())
+    breakout_pts = 10 if breakout else 0
+
+    score = adx_pts + rising_pts + spread_pts + vol_pts + rsi_pts + breakout_pts
+    return {
+        "side": side, "score": score, "atr": atr, "price": close,
+        "adx": adx, "rv": rv, "rsi": rsi, "htf": "-",
+    }, "ok"
 
 
-def place_protection(symbol, entry, amount, atr, lev, side="long"):
-    """Borsa tarafinda SL ve ROI %20 kismi kar alma emirlerini koyar.
-    side: "long" ise cikis emri 'sell', "short" ise 'buy'.
+def htf_alignment(symbol, side):
+    """1 saatlik trend sinyalle ayni yonde mi? 'ok' | 'belirsiz' | 'ters'"""
+    df = fetch_df(symbol, HTF)
+    if len(df) < 30:
+        return "belirsiz"
+    last = df.iloc[-1]
+    up = last["ema_fast"] > last["ema_slow"] and last["close"] > last["ema_slow"]
+    down = last["ema_fast"] < last["ema_slow"] and last["close"] < last["ema_slow"]
+    if side == "long":
+        return "ok" if up else ("ters" if down else "belirsiz")
+    return "ok" if down else ("ters" if up else "belirsiz")
+
+
+def scan_market(skip):
+    """Tum coinleri tarar, puanlar, puana gore sirali aday listesi doner."""
+    symbols = get_dynamic_symbols()
+    log.info(f"Hacim araligindaki coin sayisi: {len(symbols)}")
+    reasons = {}
+    stage1 = []
+
+    for symbol in symbols:
+        if symbol in skip:
+            continue
+        wait_if_banned()
+        try:
+            df = fetch_df(symbol, TIMEFRAME)
+        except Exception as e:
+            log.error(f"{symbol} veri hatasi: {e}")
+            if note_ban(e):
+                return []
+            continue
+        cand, reason = evaluate(df)
+        if cand is None:
+            reasons[reason] = reasons.get(reason, 0) + 1
+            continue
+        if (cand["side"] == "long" and not ALLOW_LONG) or (cand["side"] == "short" and not ALLOW_SHORT):
+            continue
+        cand["symbol"] = symbol
+        stage1.append(cand)
+
+    stage1.sort(key=lambda c: c["score"], reverse=True)
+    final = []
+    for cand in stage1[:HTF_CHECK_TOP]:
+        wait_if_banned()
+        try:
+            htf = htf_alignment(cand["symbol"], cand["side"])
+        except Exception as e:
+            log.error(f"{cand['symbol']} ust zaman hatasi: {e}")
+            if note_ban(e):
+                break
+            continue
+        if htf == "ters":
+            reasons["ust_trend_ters"] = reasons.get("ust_trend_ters", 0) + 1
+            continue
+        cand["score"] += HTF_PTS if htf == "ok" else HTF_PTS / 2
+        cand["htf"] = htf
+        final.append(cand)
+
+    final.sort(key=lambda c: c["score"], reverse=True)
+    log.info(f"Elenenler: {reasons} | Trend adayi: {len(stage1)} | Ust trend teyidi gecen: {len(final)}")
+    for c in final[:5]:
+        log.info(f"  ⭐ {c['symbol']} {c['side'].upper()} puan={c['score']:.0f} adx={c['adx']:.0f} "
+                 f"hacimx={c['rv']:.1f} rsi={c['rsi']:.0f} 1s={c['htf']}")
+    return [c for c in final if c["score"] >= MIN_TREND_SCORE]
+
+
+# ---------------- KORUMA EMIRLERI ----------------
+def place_protection(symbol, entry, amount, atr, side="long"):
+    """Borsa tarafinda SL ve ilk kismi kar alma emirlerini koyar.
     SL konamazsa None doner (pozisyon kapatilmali)."""
     exit_side = "sell" if side == "long" else "buy"
-    move = (TP1_ROI / 100) / lev  # ROI %20 = fiyat hareketi %20 / kaldirac
     if side == "long":
         sl_raw = entry - SL_ATR * atr
-        tp_raw = entry * (1 + move)
+        tp_raw = entry + TP1_ATR * atr
     else:
         sl_raw = entry + SL_ATR * atr
-        tp_raw = entry * (1 - move)
+        tp_raw = entry - TP1_ATR * atr
     sl_price = float(ex.price_to_precision(symbol, sl_raw))
     tp_price = float(ex.price_to_precision(symbol, tp_raw))
     tp_amount = float(ex.amount_to_precision(symbol, amount * TP1_CLOSE_PCT))
@@ -214,40 +401,13 @@ def place_protection(symbol, entry, amount, atr, lev, side="long"):
         try:
             ex.create_order(symbol, "TAKE_PROFIT_MARKET", exit_side, tp_amount, None,
                             {"stopPrice": tp_price, "reduceOnly": True})
-            log.info(f"🎯 TP kondu (%{TP1_CLOSE_PCT*100:.0f} kapanir): {symbol} @ {tp_price} (ROI %{TP1_ROI})")
+            log.info(f"🎯 TP kondu (%{TP1_CLOSE_PCT*100:.0f} kapanir): {symbol} @ {tp_price}")
         except Exception as e:
             log.error(f"{symbol} TP konamadi: {e}")
     return {"sl_id": sl_order.get("id"), "sl_price": sl_price}
 
 
-# ---------------- GEZEN STOP (TRAILING) ----------------
-trail_state = {}
-trail_lock = threading.Lock()
-
-
-def save_state():
-    try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(trail_state, f)
-    except Exception as e:
-        log.error(f"State kaydedilemedi: {e}")
-
-
-def load_state():
-    try:
-        with open(STATE_FILE) as f:
-            loaded = json.load(f)
-        for st in loaded.values():  # eski kayitlari yeni formata cevir
-            st.setdefault("side", "long")
-            st.setdefault("ext", st.pop("high", st.get("sl_price", 0)))
-        trail_state.update(loaded)
-        log.info(f"State yuklendi: {list(trail_state.keys())}")
-    except Exception:
-        pass
-
-
 def cancel_safe(order_id, symbol):
-    """Normal ve kosullu emir iptalini dener."""
     for params in ({}, {"trigger": True}):
         try:
             ex.cancel_order(order_id, symbol, params)
@@ -265,71 +425,168 @@ def cancel_all_safe(symbol):
             pass
 
 
+def find_stop_order(symbol, exit_side):
+    """Borsadaki mevcut stop emrini bulur. Doner: (id, stop_fiyati) | (None, None)."""
+    best = (None, None)
+    for params in ({}, {"trigger": True}):
+        try:
+            orders = ex.fetch_open_orders(symbol, params=params)
+        except Exception:
+            continue
+        for o in orders:
+            typ = str(o.get("type", "")).lower()
+            if o.get("side") != exit_side or "stop" not in typ:
+                continue
+            price = o.get("stopPrice") or o.get("triggerPrice") or (o.get("info") or {}).get("stopPrice")
+            try:
+                price = float(price)
+            except (TypeError, ValueError):
+                continue
+            if price <= 0:
+                continue
+            if best[0] is None:
+                best = (o.get("id"), price)
+            elif exit_side == "sell" and price > best[1]:   # long: en yuksek stop gecerli
+                best = (o.get("id"), price)
+            elif exit_side == "buy" and price < best[1]:    # short: en dusuk stop gecerli
+                best = (o.get("id"), price)
+    return best
+
+
+def adopt_position(symbol, pos):
+    """Kaydi olmayan acik pozisyonu sahiplenir (yeniden baslatma sonrasi)."""
+    side = pos.get("side")
+    size = float(pos.get("contracts") or 0)
+    entry = float(pos.get("entryPrice") or 0)
+    if side not in ("long", "short") or size <= 0 or entry <= 0:
+        return False
+    df = fetch_df(symbol, TIMEFRAME)
+    atr = float(df.iloc[-1]["atr"]) if len(df) else 0.0
+    if not atr or atr != atr:
+        return False
+    price = float(ex.fetch_ticker(symbol)["last"])
+    exit_side = "sell" if side == "long" else "buy"
+    sl_id, sl_price = find_stop_order(symbol, exit_side)
+    if sl_id is None:
+        raw = price - SL_ATR * atr if side == "long" else price + SL_ATR * atr
+        sl_price = float(ex.price_to_precision(symbol, raw))
+        amount = float(ex.amount_to_precision(symbol, size))
+        order = ex.create_order(symbol, "STOP_MARKET", exit_side, amount, None,
+                                {"stopPrice": sl_price, "reduceOnly": True})
+        sl_id = order.get("id")
+        log.warning(f"🛟 {symbol} stop'suz pozisyon bulundu, SL kondu @ {sl_price}")
+    ext = max(entry, price) if side == "long" else min(entry, price)
+    with trail_lock:
+        trail_state[symbol] = {
+            "side": side, "atr": atr, "ext": ext, "sl_price": sl_price,
+            "sl_id": sl_id, "amount": float(ex.amount_to_precision(symbol, size)),
+        }
+        save_state()
+    log.info(f"🤝 {symbol} ({side}) pozisyonu sahiplenildi, gezen stop surecek. SL: {sl_price}")
+    return True
+
+
+# ---------------- GEZEN STOP (TRAILING) ----------------
 def trail_loop():
-    """Fiyat yukseldikce SL'yi yukari ceker, asla asagi indirmez."""
+    """Fiyat lehine gittikce SL'yi ceker, asla geri almaz."""
     log.info("Gezen stop dongusu basladi.")
+    adopt_retry = {}
     while True:
         wait_if_banned()
         try:
+            sizes = {}
+            for p in ex.fetch_positions():
+                c = float(p.get("contracts") or 0)
+                if c > 0:
+                    sizes[p["symbol"]] = (c, p.get("side"), p)
+
+            # Kaydi olmayan pozisyonlari sahiplen
+            for symbol, (size, pos_side, p) in sizes.items():
+                with trail_lock:
+                    known = symbol in trail_state
+                with open_lock:
+                    opening = symbol in opening_symbols
+                if known or opening or time.time() < adopt_retry.get(symbol, 0):
+                    continue
+                try:
+                    ok = adopt_position(symbol, p)
+                except Exception as e:
+                    log.error(f"{symbol} sahiplenme hatasi: {e}")
+                    note_ban(e)
+                    ok = False
+                if not ok:
+                    adopt_retry[symbol] = time.time() + 300
+
             with trail_lock:
                 symbols = list(trail_state.keys())
 
-            if symbols:
-                sizes = {}
-                for p in ex.fetch_positions():
-                    sizes[p["symbol"]] = (float(p.get("contracts") or 0), p.get("side"))
-
-                for symbol in symbols:
-                    try:
-                        st = trail_state.get(symbol)
-                        if not st:
+            for symbol in symbols:
+                try:
+                    st = trail_state.get(symbol)
+                    if not st:
+                        continue
+                    size, pos_side, _p = sizes.get(symbol, (0, None, None))
+                    with open_lock:
+                        if symbol in opening_symbols:
                             continue
 
-                        size, pos_side = sizes.get(symbol, (0, None))
-                        if size > 0 and pos_side and pos_side != st["side"]:
-                            # kayit eski, pozisyon ters yonde: bu pozisyona dokunma
-                            log.warning(f"{symbol} yon uyusmazligi (kayit {st['side']}, borsa {pos_side}), kayit silindi.")
-                            with trail_lock:
-                                trail_state.pop(symbol, None)
-                                save_state()
-                            continue
-                        if size <= 0:  # pozisyon kapandi, artan emirleri temizle
-                            cancel_all_safe(symbol)
-                            with trail_lock:
-                                trail_state.pop(symbol, None)
-                                save_state()
-                            log.info(f"{symbol} kapandi, gezen stop birakildi.")
-                            continue
-
-                        price = float(ex.fetch_ticker(symbol)["last"])
-                        is_long = st["side"] == "long"
-                        exit_side = "sell" if is_long else "buy"
-                        if is_long:
-                            st["ext"] = max(st["ext"], price)  # en yuksek fiyat
-                            new_sl = float(ex.price_to_precision(symbol, st["ext"] - TRAIL_ATR * st["atr"]))
-                            # Sadece yukari: en az 0.1 ATR fark olsun (gereksiz emir spami olmasin)
-                            move_ok = new_sl > st["sl_price"] + 0.1 * st["atr"] and new_sl < price
-                        else:
-                            st["ext"] = min(st["ext"], price)  # en dusuk fiyat
-                            new_sl = float(ex.price_to_precision(symbol, st["ext"] + TRAIL_ATR * st["atr"]))
-                            # Sadece asagi: stop fiyatin ustunde kalmali
-                            move_ok = new_sl < st["sl_price"] - 0.1 * st["atr"] and new_sl > price
-
-                        if move_ok:
-                            amount = float(ex.amount_to_precision(symbol, size))
-                            new_order = ex.create_order(symbol, "STOP_MARKET", exit_side, amount, None,
-                                                        {"stopPrice": new_sl, "reduceOnly": True})
-                            cancel_safe(st["sl_id"], symbol)  # once yenisi kondu, sonra eskisi iptal
-                            log.info(f"📈 {symbol} gezen stop: {st['sl_price']} -> {new_sl}")
-                            st["sl_id"] = new_order.get("id")
-                            st["sl_price"] = new_sl
-
+                    if size > 0 and pos_side and pos_side != st["side"]:
+                        log.warning(f"{symbol} yon uyusmazligi (kayit {st['side']}, borsa {pos_side}), kayit silindi.")
                         with trail_lock:
+                            trail_state.pop(symbol, None)
                             save_state()
-                    except Exception as e:
-                        log.error(f"{symbol} gezen stop hatasi: {e}")
-                        if note_ban(e):
-                            break
+                        continue
+                    if size <= 0:
+                        cancel_all_safe(symbol)
+                        with trail_lock:
+                            trail_state.pop(symbol, None)
+                            cooldown[symbol] = time.time() + COOLDOWN_SECONDS
+                            save_state()
+                        log.info(f"{symbol} kapandi, {COOLDOWN_SECONDS // 60} dk bekleme basladi.")
+                        continue
+
+                    price = float(ex.fetch_ticker(symbol)["last"])
+                    is_long = st["side"] == "long"
+                    exit_side = "sell" if is_long else "buy"
+                    if is_long:
+                        st["ext"] = max(st["ext"], price)
+                        new_sl = float(ex.price_to_precision(symbol, st["ext"] - TRAIL_ATR * st["atr"]))
+                        move_ok = new_sl > st["sl_price"] + 0.1 * st["atr"] and new_sl < price
+                    else:
+                        st["ext"] = min(st["ext"], price)
+                        new_sl = float(ex.price_to_precision(symbol, st["ext"] + TRAIL_ATR * st["atr"]))
+                        move_ok = new_sl < st["sl_price"] - 0.1 * st["atr"] and new_sl > price
+
+                    amount_now = float(ex.amount_to_precision(symbol, size))
+                    known_amt = st.get("amount")
+                    size_changed = known_amt is not None and abs(amount_now - known_amt) > 1e-12
+
+                    target = None
+                    if move_ok:
+                        target = new_sl
+                    elif size_changed:
+                        target = st["sl_price"]  # kismi kar alindi: SL miktarini kalan pozisyona esitle
+
+                    if target is not None:
+                        new_order = ex.create_order(symbol, "STOP_MARKET", exit_side, amount_now, None,
+                                                    {"stopPrice": target, "reduceOnly": True})
+                        cancel_safe(st["sl_id"], symbol)  # once yenisi kondu, sonra eskisi iptal
+                        if move_ok:
+                            log.info(f"📈 {symbol} gezen stop: {st['sl_price']} -> {target}")
+                        else:
+                            log.info(f"✂️ {symbol} kismi kar alindi, SL miktari guncellendi.")
+                        st["sl_id"] = new_order.get("id")
+                        st["sl_price"] = target
+                        st["amount"] = amount_now
+                    elif known_amt is None:
+                        st["amount"] = amount_now
+
+                    with trail_lock:
+                        save_state()
+                except Exception as e:
+                    log.error(f"{symbol} gezen stop hatasi: {e}")
+                    if note_ban(e):
+                        break
         except Exception as e:
             log.error(f"Gezen stop dongu hatasi: {e}")
             note_ban(e)
@@ -337,9 +594,80 @@ def trail_loop():
         time.sleep(TRAIL_CHECK_SECONDS)
 
 
+# ---------------- ISLEM ACMA ----------------
 def get_open_symbols():
     positions = ex.fetch_positions()
     return [p["symbol"] for p in positions if float(p.get("contracts") or 0) > 0]
+
+
+def daily_loss_hit():
+    """Gun basi bakiyeye gore limit asildiysa True doner."""
+    try:
+        total = float(ex.fetch_balance()["USDT"]["total"])
+    except Exception as e:
+        log.error(f"Bakiye cekilemedi: {e}")
+        note_ban(e)
+        return False
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    with trail_lock:
+        if day_state.get("day") != today or not day_state.get("start"):
+            day_state["day"] = today
+            day_state["start"] = total
+            save_state()
+        start = float(day_state["start"])
+    loss_pct = (start - total) / start * 100 if start > 0 else 0.0
+    if loss_pct >= DAILY_LOSS_LIMIT_PCT:
+        log.warning(f"🚫 Gunluk zarar limiti doldu (%{loss_pct:.1f}). Gun sonuna kadar yeni islem yok.")
+        return True
+    return False
+
+
+def open_trade(cand, open_symbols):
+    symbol, side, atr = cand["symbol"], cand["side"], cand["atr"]
+    lev = LEV_STRONG if cand["score"] >= STRONG_SCORE else LEV_NORMAL
+    with open_lock:
+        opening_symbols.add(symbol)
+    try:
+        try:
+            ex.set_margin_mode("isolated", symbol)
+        except Exception:
+            pass
+        try:
+            ex.set_leverage(lev, symbol)
+        except Exception:
+            pass
+
+        usdt_free = float(ex.fetch_balance()["USDT"]["free"])
+        amount = float(ex.amount_to_precision(symbol, usdt_free * MARGIN_PCT * lev / cand["price"]))
+        if amount <= 0:
+            return False
+
+        if side == "long":
+            order = ex.create_market_buy_order(symbol, amount)
+        else:
+            order = ex.create_market_sell_order(symbol, amount)
+        entry = float(order.get("average") or order.get("price") or cand["price"])
+        log.info(f"🚀 ISLEM ACILDI ({side.upper()}): {symbol} | Puan: {cand['score']:.0f} | "
+                 f"Miktar: {amount} | Kaldirac: {lev}x | Giris: {entry}")
+        open_symbols.append(symbol)
+
+        prot = place_protection(symbol, entry, amount, atr, side)
+        if prot:
+            with trail_lock:
+                trail_state[symbol] = {
+                    "side": side, "atr": atr, "ext": entry,
+                    "sl_price": prot["sl_price"], "sl_id": prot["sl_id"], "amount": amount,
+                }
+                save_state()
+        else:
+            log.error(f"{symbol} SL yok, pozisyon kapatiliyor!")
+            close_side = "sell" if side == "long" else "buy"
+            ex.create_order(symbol, "market", close_side, amount, None, {"reduceOnly": True})
+            open_symbols.remove(symbol)
+        return True
+    finally:
+        with open_lock:
+            opening_symbols.discard(symbol)
 
 
 def bot_loop():
@@ -353,89 +681,39 @@ def bot_loop():
                 log.error(f"Pozisyonlar cekilemedi: {e}")
                 note_ban(e)
                 time.sleep(30)
-                continue  # pozisyon bilgisi yoksa yeni islem acma
+                continue
 
             if len(open_symbols) >= MAX_OPEN:
                 log.info(f"Pozisyon limiti dolu ({len(open_symbols)}/{MAX_OPEN}), yeni tarama yapilmadi.")
                 time.sleep(LOOP_SECONDS)
                 continue
 
-            symbols = get_dynamic_symbols()
-            log.info(f"Secilen coinler: {symbols}")
-            if not symbols:
-                time.sleep(30)
+            if daily_loss_hit():
+                time.sleep(LOOP_SECONDS)
                 continue
 
-            for symbol in symbols:
+            now = time.time()
+            with trail_lock:
+                for s in [s for s, t in cooldown.items() if t <= now]:
+                    cooldown.pop(s, None)
+                skip = set(open_symbols) | set(cooldown.keys())
+
+            candidates = scan_market(skip)
+            if not candidates:
+                log.info("Bu turda esigi gecen trend yok, islem acilmadi.")
+
+            for cand in candidates:
                 if len(open_symbols) >= MAX_OPEN:
                     break
-                if symbol in open_symbols:
+                if cand["symbol"] in open_symbols:
                     continue
-
                 try:
-                    ohlcv = ex.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=60)
-                    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-                    df = df.iloc[:-1].copy()  # acik mumu at
-                    df = calculate_indicators(df)
-
-                    score, signal = check_signals(df)
-                    log.info(f"{symbol} | Skor: {score} | Sinyal: {signal}")
-                    if signal == "BUY" and not ALLOW_LONG:
-                        continue
-                    if signal == "SELL" and not ALLOW_SHORT:
-                        continue
-                    if signal not in ("BUY", "SELL"):
-                        continue
-                    side = "long" if signal == "BUY" else "short"
-
-                    lev = LEV_BY_SCORE.get(score, 5)
-                    try:
-                        ex.set_margin_mode("isolated", symbol)
-                    except Exception:
-                        pass
-                    try:
-                        ex.set_leverage(lev, symbol)
-                    except Exception:
-                        pass
-
-                    usdt_free = float(ex.fetch_balance()["USDT"]["free"])
-                    last = df.iloc[-1]
-                    amount = float(ex.amount_to_precision(symbol, usdt_free * MARGIN_PCT * lev / last["close"]))
-                    if amount <= 0:
-                        continue
-
-                    if side == "long":
-                        order = ex.create_market_buy_order(symbol, amount)
-                    else:
-                        order = ex.create_market_sell_order(symbol, amount)
-                    entry = float(order.get("average") or order.get("price") or last["close"])
-                    log.info(f"🚀 ISLEM ACILDI ({side.upper()}): {symbol} | Miktar: {amount} | Kaldirac: {lev}x | Giris: {entry}")
-                    open_symbols.append(symbol)
-
-                    prot = place_protection(symbol, entry, amount, float(last["atr"]), lev, side)
-                    if prot:
-                        with trail_lock:
-                            trail_state[symbol] = {
-                                "side": side,
-                                "atr": float(last["atr"]),
-                                "ext": entry,
-                                "sl_price": prot["sl_price"],
-                                "sl_id": prot["sl_id"],
-                            }
-                            save_state()
-                    else:
-                        log.error(f"{symbol} SL yok, pozisyon aciliyor kapatiliyor!")
-                        close_side = "sell" if side == "long" else "buy"
-                        ex.create_order(symbol, "market", close_side, amount, None, {"reduceOnly": True})
-                        open_symbols.remove(symbol)
+                    open_trade(cand, open_symbols)
                     time.sleep(2)
-
                 except Exception as inner_err:
-                    log.error(f"{symbol} islem hatasi: {inner_err}")
+                    log.error(f"{cand['symbol']} islem hatasi: {inner_err}")
                     if note_ban(inner_err):
-                        break  # yasak varsa kalan coinlere istek atma
-
-                time.sleep(1)
+                        break
 
         except Exception as e:
             log.error(f"Dongu hatasi: {e}")
@@ -463,7 +741,11 @@ start_bot_once()  # gunicorn ile de baslasin (1 worker kullan)
 
 @app.route("/")
 def index():
-    return jsonify({"status": "running"})
+    return jsonify({
+        "status": "running",
+        "takip_edilen": list(trail_state.keys()),
+        "bekleyen_coin": len(cooldown),
+    })
 
 
 if __name__ == "__main__":
