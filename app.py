@@ -3,6 +3,7 @@ Binance USDT-M Futures botu (7/24, 3'te 2 Indikator Filtresi) - DINAMIK HACIM FI
 Versiyon: Stop-loss + ROI %20'de pozisyonun %30'u kapanir + sadece kapanmis mum
 """
 import os
+import re
 import json
 import time
 import logging
@@ -62,6 +63,43 @@ if TESTNET:
     ex.set_sandbox_mode(True)
 
 
+# ---------------- BAN / HIZ KORUMASI ----------------
+ban_until = 0.0  # epoch saniye; bu zamana kadar Binance'e istek atilmaz
+ban_lock = threading.Lock()
+
+
+def note_ban(err):
+    """Hata metninde Binance yasagi veya bolge engeli varsa bekleme suresini ayarlar.
+    Yasakliysa True doner."""
+    global ban_until
+    text = str(err)
+    wait_until = 0.0
+    m = re.search(r"banned until (\d{10,})", text)
+    if m:
+        wait_until = int(m.group(1)) / 1000.0 + 15  # bitisten 15 sn sonra dene
+    elif "418" in text or "-1003" in text or "429" in text or "Too many requests" in text:
+        wait_until = time.time() + 120               # sure yoksa 2 dk bekle
+    elif "restricted location" in text or "451" in text:
+        wait_until = time.time() + 600               # bolge engeli: 10 dk bekle
+    if wait_until:
+        with ban_lock:
+            if wait_until > ban_until:
+                ban_until = wait_until
+                left = int(ban_until - time.time())
+                log.error(f"⛔ Binance yasagi/limit algilandi, {left} sn istek atilmayacak.")
+        return True
+    return False
+
+
+def wait_if_banned():
+    """Yasak suruyorsa bitene kadar uyur (en fazla 60 sn'lik parcalarla)."""
+    while True:
+        left = ban_until - time.time()
+        if left <= 0:
+            return
+        time.sleep(min(left, 60))
+
+
 def get_dynamic_symbols():
     try:
         url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
@@ -69,6 +107,7 @@ def get_dynamic_symbols():
         data = response.json()
         if not isinstance(data, list):
             log.error(f"Beklenmeyen veri formati: {data}")
+            note_ban(data)
             return []
 
         valid = {}
@@ -201,6 +240,7 @@ def trail_loop():
     """Fiyat yukseldikce SL'yi yukari ceker, asla asagi indirmez."""
     log.info("Gezen stop dongusu basladi.")
     while True:
+        wait_if_banned()
         try:
             with trail_lock:
                 symbols = list(trail_state.keys())
@@ -241,8 +281,11 @@ def trail_loop():
                             save_state()
                     except Exception as e:
                         log.error(f"{symbol} gezen stop hatasi: {e}")
+                        if note_ban(e):
+                            break
         except Exception as e:
             log.error(f"Gezen stop dongu hatasi: {e}")
+            note_ban(e)
 
         time.sleep(TRAIL_CHECK_SECONDS)
 
@@ -255,19 +298,26 @@ def get_open_symbols():
 def bot_loop():
     log.info("Bot arkaplan dongusu basladi.")
     while True:
+        wait_if_banned()
         try:
+            try:
+                open_symbols = get_open_symbols()
+            except Exception as e:
+                log.error(f"Pozisyonlar cekilemedi: {e}")
+                note_ban(e)
+                time.sleep(30)
+                continue  # pozisyon bilgisi yoksa yeni islem acma
+
+            if len(open_symbols) >= MAX_OPEN:
+                log.info(f"Pozisyon limiti dolu ({len(open_symbols)}/{MAX_OPEN}), yeni tarama yapilmadi.")
+                time.sleep(LOOP_SECONDS)
+                continue
+
             symbols = get_dynamic_symbols()
             log.info(f"Secilen coinler: {symbols}")
             if not symbols:
                 time.sleep(30)
                 continue
-
-            try:
-                open_symbols = get_open_symbols()
-            except Exception as e:
-                log.error(f"Pozisyonlar cekilemedi: {e}")
-                time.sleep(30)
-                continue  # pozisyon bilgisi yoksa yeni islem acma
 
             for symbol in symbols:
                 if len(open_symbols) >= MAX_OPEN:
@@ -325,11 +375,14 @@ def bot_loop():
 
                 except Exception as inner_err:
                     log.error(f"{symbol} islem hatasi: {inner_err}")
+                    if note_ban(inner_err):
+                        break  # yasak varsa kalan coinlere istek atma
 
                 time.sleep(1)
 
         except Exception as e:
             log.error(f"Dongu hatasi: {e}")
+            note_ban(e)
 
         time.sleep(LOOP_SECONDS)
 
