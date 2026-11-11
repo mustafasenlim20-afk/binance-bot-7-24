@@ -1,6 +1,6 @@
 """
 Binance USDT-M Futures botu (7/24, 3'te 2 Indikator Filtresi) - DINAMIK HACIM FILTRELI (20M - 800M)
-Versiyon: Stop-loss + ROI %20'de pozisyonun %30'u kapanir + sadece kapanmis mum
+Versiyon: LONG + SHORT, Stop-loss, ROI %20'de pozisyonun %30'u kapanir, gezen stop, ban korumasi, sadece kapanmis mum
 """
 import os
 import re
@@ -27,6 +27,10 @@ TP1_ROI = 20.0          # ROI %20 olunca
 TP1_CLOSE_PCT = 0.30    # pozisyonun %30'unu kapat
 TRAIL_ATR = 1.5         # Gezen stop mesafesi: en yuksek fiyat - 1.5 x ATR
 TRAIL_CHECK_SECONDS = 20  # Gezen stop kac saniyede bir kontrol edilsin
+LONG_RSI = (45, 65)     # Long icin RSI araligi
+SHORT_RSI = (35, 55)    # Short icin RSI araligi
+ALLOW_LONG = True
+ALLOW_SHORT = True
 STATE_FILE = "bot_state.json"
 TESTNET = False
 MAX_COIN_PRICE = 500.0
@@ -151,34 +155,55 @@ def calculate_indicators(df):
 
 
 def check_signals(df):
-    """Son KAPANMIS muma bakar (df'de acik mum yok)."""
+    """Son KAPANMIS muma bakar (df'de acik mum yok).
+    Doner: (skor, "BUY" | "SELL" | "HOLD"). BUY = long, SELL = short."""
     if len(df) < 25:
         return 0, "HOLD"
     last = df.iloc[-1]
     if pd.isna(last["rsi"]) or pd.isna(last["atr"]):
         return 0, "HOLD"
 
-    score = 0
+    long_score = 0
     if last["ema_fast"] > last["ema_slow"]:
-        score += 1
-    if 45 <= last["rsi"] <= 65:
-        score += 1
+        long_score += 1
+    if LONG_RSI[0] <= last["rsi"] <= LONG_RSI[1]:
+        long_score += 1
     if last["close"] > last["ema_fast"]:
-        score += 1
+        long_score += 1
 
-    return score, ("BUY" if score >= MIN_SCORE else "HOLD")
+    short_score = 0
+    if last["ema_fast"] < last["ema_slow"]:
+        short_score += 1
+    if SHORT_RSI[0] <= last["rsi"] <= SHORT_RSI[1]:
+        short_score += 1
+    if last["close"] < last["ema_fast"]:
+        short_score += 1
+
+    if long_score >= MIN_SCORE and long_score > short_score:
+        return long_score, "BUY"
+    if short_score >= MIN_SCORE and short_score > long_score:
+        return short_score, "SELL"
+    return max(long_score, short_score), "HOLD"  # esitlik = belirsiz, islem yok
 
 
-def place_protection(symbol, entry, amount, atr, lev):
+def place_protection(symbol, entry, amount, atr, lev, side="long"):
     """Borsa tarafinda SL ve ROI %20 kismi kar alma emirlerini koyar.
-    SL konamazsa False doner (pozisyon kapatilmali)."""
-    sl_price = float(ex.price_to_precision(symbol, entry - SL_ATR * atr))
-    # ROI %20 = fiyat hareketi %20 / kaldirac
-    tp_price = float(ex.price_to_precision(symbol, entry * (1 + (TP1_ROI / 100) / lev)))
+    side: "long" ise cikis emri 'sell', "short" ise 'buy'.
+    SL konamazsa None doner (pozisyon kapatilmali)."""
+    exit_side = "sell" if side == "long" else "buy"
+    move = (TP1_ROI / 100) / lev  # ROI %20 = fiyat hareketi %20 / kaldirac
+    if side == "long":
+        sl_raw = entry - SL_ATR * atr
+        tp_raw = entry * (1 + move)
+    else:
+        sl_raw = entry + SL_ATR * atr
+        tp_raw = entry * (1 - move)
+    sl_price = float(ex.price_to_precision(symbol, sl_raw))
+    tp_price = float(ex.price_to_precision(symbol, tp_raw))
     tp_amount = float(ex.amount_to_precision(symbol, amount * TP1_CLOSE_PCT))
 
     try:
-        sl_order = ex.create_order(symbol, "STOP_MARKET", "sell", amount, None,
+        sl_order = ex.create_order(symbol, "STOP_MARKET", exit_side, amount, None,
                                    {"stopPrice": sl_price, "reduceOnly": True})
         log.info(f"🛑 SL kondu: {symbol} @ {sl_price}")
     except Exception as e:
@@ -187,7 +212,7 @@ def place_protection(symbol, entry, amount, atr, lev):
 
     if tp_amount > 0:
         try:
-            ex.create_order(symbol, "TAKE_PROFIT_MARKET", "sell", tp_amount, None,
+            ex.create_order(symbol, "TAKE_PROFIT_MARKET", exit_side, tp_amount, None,
                             {"stopPrice": tp_price, "reduceOnly": True})
             log.info(f"🎯 TP kondu (%{TP1_CLOSE_PCT*100:.0f} kapanir): {symbol} @ {tp_price} (ROI %{TP1_ROI})")
         except Exception as e:
@@ -211,7 +236,11 @@ def save_state():
 def load_state():
     try:
         with open(STATE_FILE) as f:
-            trail_state.update(json.load(f))
+            loaded = json.load(f)
+        for st in loaded.values():  # eski kayitlari yeni formata cevir
+            st.setdefault("side", "long")
+            st.setdefault("ext", st.pop("high", st.get("sl_price", 0)))
+        trail_state.update(loaded)
         log.info(f"State yuklendi: {list(trail_state.keys())}")
     except Exception:
         pass
@@ -246,7 +275,9 @@ def trail_loop():
                 symbols = list(trail_state.keys())
 
             if symbols:
-                sizes = {p["symbol"]: float(p.get("contracts") or 0) for p in ex.fetch_positions()}
+                sizes = {}
+                for p in ex.fetch_positions():
+                    sizes[p["symbol"]] = (float(p.get("contracts") or 0), p.get("side"))
 
                 for symbol in symbols:
                     try:
@@ -254,7 +285,14 @@ def trail_loop():
                         if not st:
                             continue
 
-                        size = sizes.get(symbol, 0)
+                        size, pos_side = sizes.get(symbol, (0, None))
+                        if size > 0 and pos_side and pos_side != st["side"]:
+                            # kayit eski, pozisyon ters yonde: bu pozisyona dokunma
+                            log.warning(f"{symbol} yon uyusmazligi (kayit {st['side']}, borsa {pos_side}), kayit silindi.")
+                            with trail_lock:
+                                trail_state.pop(symbol, None)
+                                save_state()
+                            continue
                         if size <= 0:  # pozisyon kapandi, artan emirleri temizle
                             cancel_all_safe(symbol)
                             with trail_lock:
@@ -264,13 +302,22 @@ def trail_loop():
                             continue
 
                         price = float(ex.fetch_ticker(symbol)["last"])
-                        st["high"] = max(st["high"], price)
-                        new_sl = float(ex.price_to_precision(symbol, st["high"] - TRAIL_ATR * st["atr"]))
+                        is_long = st["side"] == "long"
+                        exit_side = "sell" if is_long else "buy"
+                        if is_long:
+                            st["ext"] = max(st["ext"], price)  # en yuksek fiyat
+                            new_sl = float(ex.price_to_precision(symbol, st["ext"] - TRAIL_ATR * st["atr"]))
+                            # Sadece yukari: en az 0.1 ATR fark olsun (gereksiz emir spami olmasin)
+                            move_ok = new_sl > st["sl_price"] + 0.1 * st["atr"] and new_sl < price
+                        else:
+                            st["ext"] = min(st["ext"], price)  # en dusuk fiyat
+                            new_sl = float(ex.price_to_precision(symbol, st["ext"] + TRAIL_ATR * st["atr"]))
+                            # Sadece asagi: stop fiyatin ustunde kalmali
+                            move_ok = new_sl < st["sl_price"] - 0.1 * st["atr"] and new_sl > price
 
-                        # Sadece yukari: en az 0.1 ATR fark olsun (gereksiz emir spami olmasin)
-                        if new_sl > st["sl_price"] + 0.1 * st["atr"] and new_sl < price:
+                        if move_ok:
                             amount = float(ex.amount_to_precision(symbol, size))
-                            new_order = ex.create_order(symbol, "STOP_MARKET", "sell", amount, None,
+                            new_order = ex.create_order(symbol, "STOP_MARKET", exit_side, amount, None,
                                                         {"stopPrice": new_sl, "reduceOnly": True})
                             cancel_safe(st["sl_id"], symbol)  # once yenisi kondu, sonra eskisi iptal
                             log.info(f"📈 {symbol} gezen stop: {st['sl_price']} -> {new_sl}")
@@ -333,8 +380,13 @@ def bot_loop():
 
                     score, signal = check_signals(df)
                     log.info(f"{symbol} | Skor: {score} | Sinyal: {signal}")
-                    if signal != "BUY":
+                    if signal == "BUY" and not ALLOW_LONG:
                         continue
+                    if signal == "SELL" and not ALLOW_SHORT:
+                        continue
+                    if signal not in ("BUY", "SELL"):
+                        continue
+                    side = "long" if signal == "BUY" else "short"
 
                     lev = LEV_BY_SCORE.get(score, 5)
                     try:
@@ -352,24 +404,29 @@ def bot_loop():
                     if amount <= 0:
                         continue
 
-                    order = ex.create_market_buy_order(symbol, amount)
+                    if side == "long":
+                        order = ex.create_market_buy_order(symbol, amount)
+                    else:
+                        order = ex.create_market_sell_order(symbol, amount)
                     entry = float(order.get("average") or order.get("price") or last["close"])
-                    log.info(f"🚀 ISLEM ACILDI: {symbol} | Miktar: {amount} | Kaldirac: {lev}x | Giris: {entry}")
+                    log.info(f"🚀 ISLEM ACILDI ({side.upper()}): {symbol} | Miktar: {amount} | Kaldirac: {lev}x | Giris: {entry}")
                     open_symbols.append(symbol)
 
-                    prot = place_protection(symbol, entry, amount, float(last["atr"]), lev)
+                    prot = place_protection(symbol, entry, amount, float(last["atr"]), lev, side)
                     if prot:
                         with trail_lock:
                             trail_state[symbol] = {
+                                "side": side,
                                 "atr": float(last["atr"]),
-                                "high": entry,
+                                "ext": entry,
                                 "sl_price": prot["sl_price"],
                                 "sl_id": prot["sl_id"],
                             }
                             save_state()
                     else:
                         log.error(f"{symbol} SL yok, pozisyon aciliyor kapatiliyor!")
-                        ex.create_order(symbol, "market", "sell", amount, None, {"reduceOnly": True})
+                        close_side = "sell" if side == "long" else "buy"
+                        ex.create_order(symbol, "market", close_side, amount, None, {"reduceOnly": True})
                         open_symbols.remove(symbol)
                     time.sleep(2)
 
