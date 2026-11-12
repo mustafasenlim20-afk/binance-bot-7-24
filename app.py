@@ -1,4 +1,4 @@
-"""
+""
 Binance USDT-M Futures botu (7/24) - WEBSOCKET VERI + REST SADECE ISLEM
 - Fiyat ve mum verisi WebSocket'ten gelir (REST'e istek atilmaz)
 - REST sadece: al/sat, stop koy, gezen stop guncelle, pozisyon senkronu (60 sn'de 1 istek)
