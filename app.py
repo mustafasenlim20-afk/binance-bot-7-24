@@ -361,6 +361,22 @@ def symbols_from_cache():
     return sorted(valid, key=valid.get, reverse=True)
 
 
+def is_tradfi(symbol):
+    """Hisse/emtia/doviz vadelisi (TradFi-Perps) mi? Bilgi yoksa False doner (yanlis eleme olmasin)."""
+    try:
+        info = ((ex.markets or {}).get(symbol) or {}).get("info") or {}
+        ctype = str(info.get("contractType", "")).upper()
+        utype = str(info.get("underlyingType", "")).upper()
+        subs = [str(x).upper() for x in (info.get("underlyingSubType") or [])]
+        if "TRADIFI" in ctype or "TRADFI" in ctype:
+            return True
+        if utype in ("EQUITY", "COMMODITY", "TRADFI", "TRADIFI", "FX", "FOREX"):
+            return True
+        return any("TRADFI" in s or "TRADIFI" in s for s in subs)
+    except Exception:
+        return False
+
+
 def refresh_tickers_rest():
     """Sadece WS calismiyorsa: tek istekle tum coinleri ceker."""
     global rest_ticker_ts
@@ -577,6 +593,10 @@ def htf_alignment(symbol, side):
 
 def scan_market(skip):
     symbols = get_dynamic_symbols()
+    tradfi = {s for s in symbols if is_tradfi(s)}
+    if tradfi:
+        symbols = [s for s in symbols if s not in tradfi]
+        log.info(f"TradFi (hisse/emtia) vadeliler elendi: {len(tradfi)} adet")
     ws_ok = ws_healthy()
     log.info(f"Hacim araligindaki coin sayisi: {len(symbols)} | "
              f"veri kaynagi: {'WebSocket' if ws_ok else 'REST YEDEK'}")
@@ -1015,6 +1035,13 @@ def bot_loop():
                     time.sleep(2)
                 except Exception as inner_err:
                     log.error(f"{cand['symbol']} islem hatasi: {inner_err}")
+                    if "-4411" in str(inner_err):
+                        # TradFi-Perps sozlesmesi imzalanmamis (hisse/emtia vadelisi): 24 saat atla
+                        with trail_lock:
+                            cooldown[cand["symbol"]] = time.time() + 24 * 3600
+                            save_state()
+                        log.warning(f"🚫 {cand['symbol']} TradFi-Perps sozlesmesi gerektiriyor, 24 saat atlanacak.")
+                        continue
                     if note_ban(inner_err):
                         break
 
