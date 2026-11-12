@@ -1,10 +1,14 @@
 """
-Binance USDT-M Futures botu (7/24) - TREND PUANLAMALI TARAMA + WEBSOCKET OPTİMİZASYONU
-- 20M-800M hacim araligindaki TUM coinler taranir (12 coin siniri yok)
-- Her coin 0-100 trend puani alir, en yuksek puanli coin(ler)e girilir
-- ADX + hacim + EMA acilimi + kirilim + ust zaman dilimi uyumu ile sahte trendler elenir
-- LONG + SHORT, ATR stop-loss, kismi kar al, KADEMELI ATR gezen stop, stop sonrasi bekleme, gunluk zarar limiti
-- Render'da yeniden baslarsa acik pozisyonlari sahiplenir (borsadaki stop'u bulup gezen stopu surdurur)
+Binance USDT-M Futures botu (7/24) - WEBSOCKET VERI + REST SADECE ISLEM
+- Fiyat ve mum verisi WebSocket'ten gelir (REST'e istek atilmaz)
+- REST sadece: al/sat, stop koy, gezen stop guncelle, pozisyon senkronu (60 sn'de 1 istek)
+- Acilista her coinin gecmis mumlari REST'ten BIR KEZ cekilir (yavas, aralikli), sonrasi hep WebSocket
+- WebSocket calismazsa: kontrollu REST yedek modu (az coin, yavas, ban korumali)
+- 20M-800M hacim araligindaki TUM coinler taranir, 0-100 trend puani, LONG + SHORT
+- ATR stop-loss, kismi kar al, KADEMELI ATR gezen stop, stop sonrasi bekleme, gunluk zarar limiti
+- Render'da yeniden baslarsa acik pozisyonlari sahiplenir
+
+Gerekli paketler (requirements.txt): ccxt, pandas, flask, gunicorn, websocket-client
 """
 import os
 import re
@@ -12,10 +16,16 @@ import json
 import time
 import logging
 import threading
-import requests
+from urllib.parse import urlparse
+
 import ccxt
 import pandas as pd
 from flask import Flask, jsonify
+
+try:
+    import websocket  # pip paketi adi: websocket-client
+except ImportError:
+    websocket = None
 
 app = Flask(__name__)
 
@@ -57,13 +67,27 @@ TRAIL_TIERS = ((1.0, 3.0), (2.0, 2.0))   # kar < 1 ATR: 3x | kar 1-2 ATR: 2x
 TRAIL_TIGHT_ATR = 1.2      # kar 2 ATR'yi gecince en dar takip (1.2 x ATR)
 BREAKEVEN_AT_ATR = 1.0     # kar bu kadar ATR olunca stop en az girise cekilir (zarar etmeme)
 
-TRAIL_CHECK_SECONDS = 20
 COOLDOWN_SECONDS = 2 * 3600   # bir coin kapaninca bu sure tekrar girilmez
 DAILY_LOSS_LIMIT_PCT = 10.0   # gun basi bakiyeye gore bu kadar zarar olursa gun sonuna kadar yeni islem yok
 ALLOW_LONG = True
 ALLOW_SHORT = True
 STATE_FILE = "bot_state.json"
 TESTNET = False
+
+# --- WebSocket / istek ayarlari ---
+WS_URL = "wss://fstream.binance.com/stream"
+KLINE_KEEP = 150            # her coin icin bellekte tutulan mum sayisi
+SEED_LIMIT = 100            # acilista REST'ten cekilen gecmis mum sayisi
+SEED_SLEEP = 0.5            # gecmis mum cekerken coinler arasi bekleme (sn)
+WS_STALE_SECONDS = 45       # WS'ten bu kadar sn veri gelmezse "calismiyor" sayilir
+KLINE_STALE_SECONDS = 180   # bir coinin mumu bu kadar sn guncellenmezse bayat sayilir
+TRAIL_TICK_SECONDS = 2      # WS aciksa gezen stop kontrol sikligi (REST istegi atmaz)
+TRAIL_CHECK_SECONDS = 20    # WS yoksa REST yedek kontrol sikligi
+POSITION_SYNC_SECONDS = 60  # pozisyon kapandi mi kontrolu (tek REST istegi)
+HTF_CACHE_SECONDS = 600     # 1s verisi bu sure onbellekte tutulur
+FALLBACK_MAX_COINS = 30     # WS yoksa REST yedek modunda taranacak en fazla coin
+FALLBACK_SLEEP = 0.5        # REST yedek modunda coinler arasi bekleme (sn)
+REST_TICKER_MIN_GAP = 120   # WS yoksa coin listesi REST'ten en az bu aralikla cekilir
 # ===================================================
 
 logging.basicConfig(
@@ -93,6 +117,13 @@ if PROXY_URL:
 ex = ccxt.binanceusdm(exchange_config)
 if TESTNET:
     ex.set_sandbox_mode(True)
+
+
+def _tf_ms(tf):
+    return int(tf[:-1]) * {"m": 60_000, "h": 3_600_000, "d": 86_400_000}[tf[-1]]
+
+
+TF_MS = _tf_ms(TIMEFRAME)
 
 
 # ---------------- BAN / HIZ KORUMASI ----------------
@@ -130,11 +161,11 @@ def wait_if_banned():
 
 
 # ---------------- DURUM (state) ----------------
-trail_state = {}      
-cooldown = {}         
-day_state = {}        
+trail_state = {}
+cooldown = {}
+day_state = {}
 trail_lock = threading.Lock()
-opening_symbols = set()   
+opening_symbols = set()
 open_lock = threading.Lock()
 
 
@@ -155,7 +186,7 @@ def load_state():
             cooldown.update({k: float(v) for k, v in loaded.get("cooldown", {}).items()})
             day_state.update(loaded.get("day", {}))
         else:
-            trail = loaded  
+            trail = loaded
         for st in trail.values():
             st.setdefault("side", "long")
             st.setdefault("ext", st.pop("high", st.get("sl_price", 0)))
@@ -165,38 +196,243 @@ def load_state():
         pass
 
 
-# ---------------- COIN LISTESI ----------------
-def get_dynamic_symbols():
+# =====================================================================
+#                      WEBSOCKET VERI KATMANI
+# =====================================================================
+ws_lock = threading.Lock()
+tickers = {}          # "BTCUSDT" -> {"price": float, "vol": float(24s quote hacim)}
+tickers_ts = 0.0      # son WS ticker mesaji zamani
+klines = {}           # "BTCUSDT" -> [[t, o, h, l, c, v, kapandi_mi], ...]
+kline_ts = {}         # "BTCUSDT" -> son guncelleme zamani
+dirty = set()         # mum boslugu olan (yeniden yuklenmesi gereken) coinler
+subscribed = set()    # kline'ina abone olunan coinler
+ws_app = None
+ws_connected = False
+rest_ticker_ts = 0.0
+COLS = ["timestamp", "open", "high", "low", "close", "volume", "closed"]
+
+
+def to_raw(symbol):
+    """'BTC/USDT:USDT' -> 'BTCUSDT'"""
+    return symbol.split("/")[0] + "USDT"
+
+
+def to_ccxt(raw):
+    """'BTCUSDT' -> 'BTC/USDT:USDT'"""
+    return f"{raw[:-4]}/USDT:USDT"
+
+
+def ws_healthy():
+    return bool(websocket) and ws_connected and (time.time() - tickers_ts) < WS_STALE_SECONDS
+
+
+def ws_on_open(*args):
+    global ws_connected
+    ws_connected = True
+    log.info("✅ WebSocket baglandi.")
+    with ws_lock:
+        params = ["!miniTicker@arr"] + [f"{s.lower()}@kline_{TIMEFRAME}" for s in subscribed]
+    ws_send_subscribe(params)
+
+
+def ws_on_close(*args):
+    global ws_connected
+    ws_connected = False
+    log.warning("WebSocket koptu, yeniden baglanilacak.")
+
+
+def ws_on_error(*args):
+    log.error(f"WebSocket hatasi: {args[-1] if args else '?'}")
+
+
+def ws_on_message(*args):
+    global tickers_ts
     try:
-        url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
-        response = requests.get(url, timeout=15, proxies=PROXIES)
-        data = response.json()
-        if not isinstance(data, list):
-            log.error(f"Beklenmeyen veri formati: {data}")
-            note_ban(data)
-            return []
+        msg = json.loads(args[-1])
+    except Exception:
+        return
+    if not isinstance(msg, dict):
+        return
+    data = msg.get("data")
+    if data is None:       # abonelik cevabi vb.
+        return
+    stream = msg.get("stream", "")
 
-        valid = {}
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            symbol = item.get("symbol", "")
-            if not symbol.endswith("USDT"):
-                continue
-            if any(s in symbol for s in ["USDC", "BUSD", "FDUSD", "TUSD"]):
-                continue
-            try:
-                price = float(item.get("lastPrice", 0))
-                vol = float(item.get("quoteVolume", 0))
-            except (ValueError, TypeError):
-                continue
-            if 0 < price <= MAX_COIN_PRICE and MIN_VOLUME <= vol <= MAX_VOLUME:
-                valid[f"{symbol[:-4]}/USDT:USDT"] = vol
+    if stream == "!miniTicker@arr":
+        now = time.time()
+        with ws_lock:
+            for it in data:
+                try:
+                    tickers[it["s"]] = {"price": float(it["c"]), "vol": float(it["q"])}
+                except (KeyError, ValueError, TypeError):
+                    continue
+            tickers_ts = now
 
-        return sorted(valid, key=valid.get, reverse=True)
+    elif "@kline_" in stream:
+        try:
+            k = data["k"]
+            raw = data["s"]
+            row = [int(k["t"]), float(k["o"]), float(k["h"]), float(k["l"]),
+                   float(k["c"]), float(k["v"]), bool(k["x"])]
+        except (KeyError, ValueError, TypeError):
+            return
+        with ws_lock:
+            arr = klines.setdefault(raw, [])
+            if not arr:
+                arr.append(row)
+            elif arr[-1][0] == row[0]:
+                arr[-1] = row
+            elif row[0] > arr[-1][0]:
+                if row[0] - arr[-1][0] > TF_MS * 1.5:
+                    dirty.add(raw)           # arada mum kacti, REST ile yeniden yuklenecek
+                arr.append(row)
+                if len(arr) > KLINE_KEEP:
+                    del arr[0]
+            kline_ts[raw] = time.time()
+
+
+def ws_send_subscribe(params):
+    app_ = ws_app
+    if app_ is None or not ws_connected or not params:
+        return
+    try:
+        for i in range(0, len(params), 50):
+            app_.send(json.dumps({
+                "method": "SUBSCRIBE",
+                "params": params[i:i + 50],
+                "id": int(time.time() * 1000) % 1_000_000_000,
+            }))
+            time.sleep(0.15)     # Binance: saniyede en fazla 10 mesaj
     except Exception as e:
-        log.error(f"Semboller cekilirken hata: {e}")
-        return []
+        log.error(f"WS abonelik gonderilemedi: {e}")
+
+
+def ws_proxy_kwargs():
+    if not PROXY_URL:
+        return {}
+    u = urlparse(PROXY_URL)
+    kw = {
+        "http_proxy_host": u.hostname,
+        "http_proxy_port": u.port,
+        "proxy_type": "socks5" if u.scheme.startswith("socks") else "http",
+    }
+    if u.username:
+        kw["http_proxy_auth"] = (u.username, u.password or "")
+    return kw
+
+
+def ws_thread():
+    """Surekli calisir; kopunca kendini yeniden baglar."""
+    global ws_app, ws_connected
+    if websocket is None:
+        log.error("❌ 'websocket-client' paketi yok! requirements.txt'ye ekle. REST yedek modunda calisacak.")
+        return
+    fails = 0
+    while True:
+        started = time.time()
+        try:
+            ws_app = websocket.WebSocketApp(
+                WS_URL,
+                on_open=ws_on_open,
+                on_message=ws_on_message,
+                on_error=ws_on_error,
+                on_close=ws_on_close,
+            )
+            ws_app.run_forever(ping_interval=20, ping_timeout=10, **ws_proxy_kwargs())
+        except Exception as e:
+            log.error(f"WebSocket dongu hatasi: {e}")
+        ws_connected = False
+        fails = 0 if time.time() - started > 60 else min(fails + 1, 6)
+        time.sleep(min(5 * (fails + 1), 60))
+
+
+# ---------------- Coin listesi (WS onbellekten) ----------------
+def symbols_from_cache():
+    with ws_lock:
+        snap = dict(tickers)
+    valid = {}
+    for raw, t in snap.items():
+        if not raw.endswith("USDT"):
+            continue
+        if any(s in raw for s in ["USDC", "BUSD", "FDUSD", "TUSD"]):
+            continue
+        if 0 < t["price"] <= MAX_COIN_PRICE and MIN_VOLUME <= t["vol"] <= MAX_VOLUME:
+            valid[to_ccxt(raw)] = t["vol"]
+    return sorted(valid, key=valid.get, reverse=True)
+
+
+def refresh_tickers_rest():
+    """Sadece WS calismiyorsa: tek istekle tum coinleri ceker."""
+    global rest_ticker_ts
+    wait_if_banned()
+    data = ex.fetch_tickers()
+    with ws_lock:
+        for t in data.values():
+            info = t.get("info") or {}
+            try:
+                tickers[info["symbol"]] = {
+                    "price": float(info["lastPrice"]),
+                    "vol": float(info["quoteVolume"]),
+                }
+            except (KeyError, ValueError, TypeError):
+                continue
+    rest_ticker_ts = time.time()
+
+
+def get_dynamic_symbols():
+    if not ws_healthy() and time.time() - rest_ticker_ts > REST_TICKER_MIN_GAP:
+        try:
+            refresh_tickers_rest()
+        except Exception as e:
+            log.error(f"Semboller (REST yedek) cekilirken hata: {e}")
+            note_ban(e)
+    return symbols_from_cache()
+
+
+# ---------------- Mum verisi ----------------
+def is_fresh(raw):
+    with ws_lock:
+        arr = klines.get(raw)
+        return bool(arr) and len(arr) >= 60 and raw not in dirty \
+            and (time.time() - kline_ts.get(raw, 0)) < KLINE_STALE_SECONDS
+
+
+def ensure_streams(symbols):
+    with ws_lock:
+        new = [to_raw(s) for s in symbols if to_raw(s) not in subscribed]
+        subscribed.update(new)
+    if new:
+        ws_send_subscribe([f"{r.lower()}@kline_{TIMEFRAME}" for r in new])
+
+
+def seed_symbol(symbol):
+    """Gecmis mumlari REST'ten BIR KEZ yukler (sonrasi WS besler)."""
+    raw = to_raw(symbol)
+    ohlcv = ex.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=SEED_LIMIT)
+    rows = [[int(r[0]), r[1], r[2], r[3], r[4], r[5], True] for r in ohlcv]
+    if rows:
+        rows[-1][6] = False       # sonuncu mum henuz olusuyor
+    with ws_lock:
+        klines[raw] = rows
+        kline_ts[raw] = time.time()
+        dirty.discard(raw)
+
+
+def prepare_data(symbols, skip):
+    ensure_streams(symbols)
+    need = [s for s in symbols if s not in skip and not is_fresh(to_raw(s))]
+    if not need:
+        return
+    log.info(f"Gecmis mum yukleniyor (REST, aralikli): {len(need)} coin")
+    for s in need:
+        wait_if_banned()
+        try:
+            seed_symbol(s)
+        except Exception as e:
+            log.error(f"{s} gecmis mum hatasi: {e}")
+            if note_ban(e):
+                break
+        time.sleep(SEED_SLEEP)
 
 
 # ---------------- INDIKATORLER ----------------
@@ -235,7 +471,21 @@ def calculate_indicators(df):
     return df
 
 
-def fetch_df(symbol, timeframe, limit=100):
+def get_df(symbol):
+    """WebSocket onbelleginden DataFrame (REST istegi YOK)."""
+    raw = to_raw(symbol)
+    with ws_lock:
+        rows = [r[:] for r in klines.get(raw, [])]
+    if len(rows) < 2:
+        return None
+    df = pd.DataFrame(rows, columns=COLS)
+    if not rows[-1][6]:          # olusmakta olan mumu at, sadece kapanmislar kalsin
+        df = df.iloc[:-1]
+    return calculate_indicators(df.copy())
+
+
+def fetch_df_rest(symbol, timeframe, limit=100):
+    """REST ile mum (sadece yedek mod, 1s teyidi ve pozisyon sahiplenme icin)."""
     ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df = df.iloc[:-1].copy()
@@ -303,8 +553,18 @@ def evaluate(df):
     }, "ok"
 
 
+htf_cache = {}   # symbol -> (zaman, df)
+
+
 def htf_alignment(symbol, side):
-    df = fetch_df(symbol, HTF)
+    now = time.time()
+    cached = htf_cache.get(symbol)
+    if cached and now - cached[0] < HTF_CACHE_SECONDS:
+        df = cached[1]
+    else:
+        wait_if_banned()
+        df = fetch_df_rest(symbol, HTF)
+        htf_cache[symbol] = (now, df)
     if len(df) < 30:
         return "belirsiz"
     last = df.iloc[-1]
@@ -317,16 +577,37 @@ def htf_alignment(symbol, side):
 
 def scan_market(skip):
     symbols = get_dynamic_symbols()
-    log.info(f"Hacim araligindaki coin sayisi: {len(symbols)}")
+    ws_ok = ws_healthy()
+    log.info(f"Hacim araligindaki coin sayisi: {len(symbols)} | "
+             f"veri kaynagi: {'WebSocket' if ws_ok else 'REST YEDEK'}")
+    if not symbols:
+        return []
+
+    if ws_ok:
+        prepare_data(symbols, skip)
+    else:
+        symbols = symbols[:FALLBACK_MAX_COINS]
+        log.warning(f"⚠️ WebSocket hazir degil: REST yedek modu, sadece ilk {len(symbols)} coin, yavas taranacak.")
+
     reasons = {}
     stage1 = []
 
     for symbol in symbols:
         if symbol in skip:
             continue
-        wait_if_banned()
         try:
-            df = fetch_df(symbol, TIMEFRAME)
+            if ws_ok:
+                if not is_fresh(to_raw(symbol)):
+                    reasons["veri_yok"] = reasons.get("veri_yok", 0) + 1
+                    continue
+                df = get_df(symbol)
+                if df is None:
+                    reasons["veri_yok"] = reasons.get("veri_yok", 0) + 1
+                    continue
+            else:
+                wait_if_banned()
+                df = fetch_df_rest(symbol, TIMEFRAME)
+                time.sleep(FALLBACK_SLEEP)
         except Exception as e:
             log.error(f"{symbol} veri hatasi: {e}")
             if note_ban(e):
@@ -344,7 +625,6 @@ def scan_market(skip):
     stage1.sort(key=lambda c: c["score"], reverse=True)
     final = []
     for cand in stage1[:HTF_CHECK_TOP]:
-        wait_if_banned()
         try:
             htf = htf_alignment(cand["symbol"], cand["side"])
         except Exception as e:
@@ -436,9 +716,9 @@ def find_stop_order(symbol, exit_side):
                 continue
             if best[0] is None:
                 best = (o.get("id"), price)
-            elif exit_side == "sell" and price > best[1]:   
+            elif exit_side == "sell" and price > best[1]:
                 best = (o.get("id"), price)
-            elif exit_side == "buy" and price < best[1]:    
+            elif exit_side == "buy" and price < best[1]:
                 best = (o.get("id"), price)
     return best
 
@@ -449,7 +729,7 @@ def adopt_position(symbol, pos):
     entry = float(pos.get("entryPrice") or 0)
     if side not in ("long", "short") or size <= 0 or entry <= 0:
         return False
-    df = fetch_df(symbol, TIMEFRAME)
+    df = fetch_df_rest(symbol, TIMEFRAME)
     atr = float(df.iloc[-1]["atr"]) if len(df) else 0.0
     if not atr or atr != atr:
         return False
@@ -475,7 +755,7 @@ def adopt_position(symbol, pos):
     return True
 
 
-# ---------------- WEBSOCKET DESTEKLİ GEZEN STOP (TRAILING) ----------------
+# ---------------- GEZEN STOP (TRAILING) ----------------
 def trail_multiplier(profit_atr):
     for limit, mult in TRAIL_TIERS:
         if profit_atr < limit:
@@ -484,7 +764,7 @@ def trail_multiplier(profit_atr):
 
 
 def update_trailing_stop_logic(symbol, price):
-    """WebSocket'ten gelen anlık fiyatla gezen stopu ve trailing mantığını sıfır REST isteğiyle yürütür."""
+    """Anlik fiyatla gezen stopu hesaplar. REST'e SADECE stop gercekten tasinacaksa gider."""
     st = trail_state.get(symbol)
     if not st:
         return
@@ -518,26 +798,52 @@ def update_trailing_stop_logic(symbol, price):
         move_ok = new_sl < st["sl_price"] - 0.1 * atr and new_sl > price
 
     if move_ok:
+        wait_if_banned()
         try:
             amount_now = st.get("amount")
             new_order = ex.create_order(symbol, "STOP_MARKET", exit_side, amount_now, None,
                                         {"stopPrice": new_sl, "reduceOnly": True})
             cancel_safe(st["sl_id"], symbol)
-            log.info(f"📈 {symbol} gezen stop (WS): {st['sl_price']} -> {new_sl} (kar {profit_atr:.1f} ATR)")
+            log.info(f"📈 {symbol} gezen stop: {st['sl_price']} -> {new_sl} (kar {profit_atr:.1f} ATR)")
             st["sl_id"] = new_order.get("id")
             st["sl_price"] = new_sl
             with trail_lock:
                 save_state()
         except Exception as e:
-            log.error(f"{symbol} WS gezen stop güncelleme hatası: {e}")
+            log.error(f"{symbol} gezen stop guncelleme hatasi: {e}")
+            note_ban(e)
+
+
+def sync_positions(symbols):
+    """TEK REST istegiyle: kapanan pozisyonlari temizle, kalan miktari guncelle."""
+    wait_if_banned()
+    positions = ex.fetch_positions()
+    open_map = {}
+    for p in positions:
+        c = float(p.get("contracts") or 0)
+        if c > 0:
+            open_map[p["symbol"]] = c
+    for symbol in symbols:
+        if symbol in open_map:
+            with trail_lock:
+                st = trail_state.get(symbol)
+                if st:
+                    st["amount"] = float(ex.amount_to_precision(symbol, open_map[symbol]))
+        else:
+            cancel_all_safe(symbol)
+            with trail_lock:
+                trail_state.pop(symbol, None)
+                cooldown[symbol] = time.time() + COOLDOWN_SECONDS
+                save_state()
+            log.info(f"{symbol} kapandi, {COOLDOWN_SECONDS // 60} dk bekleme basladi.")
 
 
 def trail_loop():
-    """Artık REST polling yerine arka planda CCXT pro WebSockets veya Mini-Ticker kullanarak sıfır maliyetle çalışır."""
-    log.info("WebSocket tabanlı gezen stop dinleyicisi başlatılıyor.")
-    
-    # İlk açılışta mevcut pozisyonları sahiplen
+    log.info("Gezen stop dongusu basladi (WS fiyati, REST sadece stop tasirken).")
+
+    # Ilk acilista mevcut pozisyonlari sahiplen
     try:
+        wait_if_banned()
         for p in ex.fetch_positions():
             c = float(p.get("contracts") or 0)
             if c > 0:
@@ -547,41 +853,49 @@ def trail_loop():
                 if not known:
                     adopt_position(symbol, p)
     except Exception as e:
-        log.error(f"Başlangıç pozisyon sahiplenme hatası: {e}")
+        log.error(f"Baslangic pozisyon sahiplenme hatasi: {e}")
+        note_ban(e)
 
-    # WebSocket akışı aktif değilse hafifletilmiş akıllı döngü (Rate limit korumalı)
+    last_sync = time.time()
     while True:
-        wait_if_banned()
+        interval = TRAIL_TICK_SECONDS
         try:
+            wait_if_banned()
             with trail_lock:
                 symbols = list(trail_state.keys())
 
             if symbols:
-                # Sadece aktif pozisyon varsa anlık fiyatları çekip WebSocket mantığıyla işler
-                tickers = ex.fetch_tickers(symbols)
-                for symbol in symbols:
-                    if symbol in tickers:
-                        price = float(tickers[symbol]["last"])
-                        update_trailing_stop_logic(symbol, price)
-                    
-                    # Pozisyon kapandı mı kontrolü
+                prices = {}
+                if ws_healthy():
+                    with ws_lock:
+                        for s in symbols:
+                            t = tickers.get(to_raw(s))
+                            if t:
+                                prices[s] = t["price"]
+                else:
+                    # WS yok: yedek olarak tek istekle fiyatlar, yavas aralikla
+                    interval = TRAIL_CHECK_SECONDS
+                    tk = ex.fetch_tickers(symbols)
+                    for s in symbols:
+                        if s in tk and tk[s].get("last"):
+                            prices[s] = float(tk[s]["last"])
+
+                for symbol, price in prices.items():
                     try:
-                        pos_list = ex.fetch_positions([symbol])
-                        has_pos = any(float(p.get("contracts") or 0) > 0 for p in pos_list)
-                        if not has_pos:
-                            cancel_all_safe(symbol)
-                            with trail_lock:
-                                trail_state.pop(symbol, None)
-                                cooldown[symbol] = time.time() + COOLDOWN_SECONDS
-                                save_state()
-                            log.info(f"{symbol} kapandi, {COOLDOWN_SECONDS // 60} dk bekleme basladi.")
-                    except Exception:
-                        pass
+                        update_trailing_stop_logic(symbol, price)
+                    except Exception as e:
+                        log.error(f"{symbol} gezen stop hatasi: {e}")
+                        note_ban(e)
+
+                if time.time() - last_sync >= POSITION_SYNC_SECONDS:
+                    last_sync = time.time()
+                    sync_positions(symbols)
         except Exception as e:
             log.error(f"Gezen stop dongu hatasi: {e}")
             note_ban(e)
+            interval = TRAIL_CHECK_SECONDS
 
-        time.sleep(TRAIL_CHECK_SECONDS)
+        time.sleep(interval)
 
 
 # ---------------- ISLEM ACMA ----------------
@@ -721,17 +1035,20 @@ def start_bot_once():
         if not _started:
             _started = True
             load_state()
+            threading.Thread(target=ws_thread, daemon=True).start()
             threading.Thread(target=bot_loop, daemon=True).start()
             threading.Thread(target=trail_loop, daemon=True).start()
 
 
-start_bot_once()  
+start_bot_once()
 
 
 @app.route("/")
 def index():
     return jsonify({
         "status": "running",
+        "websocket": ws_healthy(),
+        "izlenen_coin": len(subscribed),
         "takip_edilen": list(trail_state.keys()),
         "bekleyen_coin": len(cooldown),
     })
