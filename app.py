@@ -713,12 +713,15 @@ def place_protection(symbol, entry, amount, atr, side="long"):
 
 
 def cancel_safe(order_id, symbol):
+    last_err = None
     for params in ({}, {"trigger": True}):
         try:
             ex.cancel_order(order_id, symbol, params)
             return True
-        except Exception:
+        except Exception as e:
+            last_err = e
             continue
+    log.warning(f"{symbol} emir iptal edilemedi (id={order_id}): {last_err}")
     return False
 
 
@@ -730,31 +733,44 @@ def cancel_all_safe(symbol):
             pass
 
 
-def find_stop_order(symbol, exit_side):
-    best = (None, None)
+def _raw_type(o):
+    """Emrin Binance'teki gercek tipi (ccxt'nin birlestirilmis 'type' alani STOP_MARKET'i 'market' gosterebilir)."""
+    info = o.get("info") or {}
+    for k in ("orderType", "origType", "type"):
+        v = info.get(k)
+        if v:
+            return str(v).upper()
+    return str(o.get("type") or "").upper()
+
+
+def find_stop_orders(symbol, exit_side):
+    """Borsadaki bu yone ait STOP-LOSS emirlerini [(id, fiyat), ...] verir (kar al emirleri sayilmaz)."""
+    found = {}
     for params in ({}, {"trigger": True}):
         try:
             orders = ex.fetch_open_orders(symbol, params=params)
-        except Exception:
+        except Exception as e:
+            log.warning(f"{symbol} acik emirler okunamadi {params}: {e}")
             continue
         for o in orders:
-            typ = str(o.get("type", "")).lower()
-            if o.get("side") != exit_side or "stop" not in typ:
+            if o.get("side") != exit_side:
                 continue
-            price = o.get("stopPrice") or o.get("triggerPrice") or (o.get("info") or {}).get("stopPrice")
+            info = o.get("info") or {}
+            raw = _raw_type(o)
+            if raw.startswith("TAKE_PROFIT"):
+                continue
+            if not (raw.startswith("STOP") or o.get("stopLossPrice")):
+                continue
+            price = (o.get("stopLossPrice") or o.get("stopPrice") or o.get("triggerPrice")
+                     or info.get("stopPrice") or info.get("triggerPrice"))
             try:
                 price = float(price)
             except (TypeError, ValueError):
                 continue
-            if price <= 0:
+            if price <= 0 or o.get("id") is None:
                 continue
-            if best[0] is None:
-                best = (o.get("id"), price)
-            elif exit_side == "sell" and price > best[1]:
-                best = (o.get("id"), price)
-            elif exit_side == "buy" and price < best[1]:
-                best = (o.get("id"), price)
-    return best
+            found[o["id"]] = price
+    return list(found.items())
 
 
 def adopt_position(symbol, pos):
@@ -769,7 +785,17 @@ def adopt_position(symbol, pos):
         return False
     price = float(ex.fetch_ticker(symbol)["last"])
     exit_side = "sell" if side == "long" else "buy"
-    sl_id, sl_price = find_stop_order(symbol, exit_side)
+    stops = find_stop_orders(symbol, exit_side)
+    log.info(f"{symbol}: borsada {len(stops)} stop-loss emri bulundu")
+    sl_id, sl_price = None, None
+    if stops:
+        # en yakin (en siki) stopu tut, fazlalari temizle
+        sl_id, sl_price = (max if exit_side == "sell" else min)(stops, key=lambda x: x[1])
+        extra = [oid for oid, _ in stops if oid != sl_id]
+        for oid in extra:
+            cancel_safe(oid, symbol)
+        if extra:
+            log.info(f"🧹 {symbol}: {len(extra)} fazla stop temizlendi")
     if sl_id is None:
         raw = price - SL_ATR * atr if side == "long" else price + SL_ATR * atr
         sl_price = float(ex.price_to_precision(symbol, raw))
