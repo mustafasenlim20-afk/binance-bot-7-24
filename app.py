@@ -222,8 +222,20 @@ def to_ccxt(raw):
     return f"{raw[:-4]}/USDT:USDT"
 
 
+START_TS = time.time()
+
+
 def ws_healthy():
     return bool(websocket) and ws_connected and (time.time() - tickers_ts) < WS_STALE_SECONDS
+
+
+def wait_for_ws(timeout=25):
+    """Bot yeni acildiysa websocket'in baglanmasini bekler (ilk tarama bos yere REST yedege dusmesin)."""
+    if websocket is None or time.time() - START_TS > 180:
+        return
+    t0 = time.time()
+    while not ws_healthy() and time.time() - t0 < timeout:
+        time.sleep(1)
 
 
 def ws_on_open(*args):
@@ -592,11 +604,13 @@ def htf_alignment(symbol, side):
 
 
 def scan_market(skip):
+    wait_for_ws()
     symbols = get_dynamic_symbols()
     tradfi = {s for s in symbols if is_tradfi(s)}
     if tradfi:
         symbols = [s for s in symbols if s not in tradfi]
-        log.info(f"TradFi (hisse/emtia) vadeliler elendi: {len(tradfi)} adet")
+        names = ", ".join(sorted(s.split("/")[0] for s in tradfi)[:12])
+        log.info(f"TradFi (hisse/emtia) vadeliler elendi: {len(tradfi)} adet ({names}...)")
     ws_ok = ws_healthy()
     log.info(f"Hacim araligindaki coin sayisi: {len(symbols)} | "
              f"veri kaynagi: {'WebSocket' if ws_ok else 'REST YEDEK'}")
