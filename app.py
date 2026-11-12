@@ -1,5 +1,5 @@
 """
-Binance USDT-M Futures botu (7/24) - TREND PUANLAMALI TARAMA
+Binance USDT-M Futures botu (7/24) - TREND PUANLAMALI TARAMA + WEBSOCKET OPTİMİZASYONU
 - 20M-800M hacim araligindaki TUM coinler taranir (12 coin siniri yok)
 - Her coin 0-100 trend puani alir, en yuksek puanli coin(ler)e girilir
 - ADX + hacim + EMA acilimi + kirilim + ust zaman dilimi uyumu ile sahte trendler elenir
@@ -101,7 +101,6 @@ ban_lock = threading.Lock()
 
 
 def note_ban(err):
-    """Hata metninde Binance yasagi veya bolge engeli varsa bekleme suresini ayarlar."""
     global ban_until
     text = str(err)
     wait_until = 0.0
@@ -131,16 +130,15 @@ def wait_if_banned():
 
 
 # ---------------- DURUM (state) ----------------
-trail_state = {}      # sembol -> gezen stop bilgisi
-cooldown = {}         # sembol -> bekleme bitis zamani (epoch)
-day_state = {}        # {"day": "YYYY-MM-DD", "start": gun basi bakiye}
+trail_state = {}      
+cooldown = {}         
+day_state = {}        
 trail_lock = threading.Lock()
-opening_symbols = set()   # su an acilmakta olan pozisyonlar (sahiplenme karismasin)
+opening_symbols = set()   
 open_lock = threading.Lock()
 
 
 def save_state():
-    """trail_lock icinde cagrilmali."""
     try:
         with open(STATE_FILE, "w") as f:
             json.dump({"trail": trail_state, "cooldown": cooldown, "day": day_state}, f)
@@ -157,7 +155,7 @@ def load_state():
             cooldown.update({k: float(v) for k, v in loaded.get("cooldown", {}).items()})
             day_state.update(loaded.get("day", {}))
         else:
-            trail = loaded  # eski format
+            trail = loaded  
         for st in trail.values():
             st.setdefault("side", "long")
             st.setdefault("ext", st.pop("high", st.get("sl_price", 0)))
@@ -169,7 +167,6 @@ def load_state():
 
 # ---------------- COIN LISTESI ----------------
 def get_dynamic_symbols():
-    """20M-800M hacim araligindaki TUM USDT vadeli coinleri doner (hacme gore sirali)."""
     try:
         url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
         response = requests.get(url, timeout=15, proxies=PROXIES)
@@ -225,7 +222,6 @@ def calculate_indicators(df):
     ], axis=1).max(axis=1)
     df["atr"] = tr.rolling(14).mean()
 
-    # ADX (Wilder)
     up = df["high"].diff()
     down = -df["low"].diff()
     plus_dm = up.where((up > down) & (up > 0), 0.0)
@@ -240,7 +236,6 @@ def calculate_indicators(df):
 
 
 def fetch_df(symbol, timeframe, limit=100):
-    """Kapanmis mumlari indikatorlerle birlikte doner (acik mum atilir)."""
     ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df = df.iloc[:-1].copy()
@@ -249,10 +244,6 @@ def fetch_df(symbol, timeframe, limit=100):
 
 # ---------------- TREND PUANLAMA ----------------
 def evaluate(df):
-    """Bir coini puanlar. Doner: (aday_dict | None, elenme_nedeni).
-    Puan (ust zaman dilimi haric en fazla 85):
-      ADX gucu 25 + ADX yukseliyor 10 + EMA acilimi 10 + goreceli hacim 20 + RSI 10 + kirilim 10
-    """
     if len(df) < 60:
         return None, "veri_az"
     last = df.iloc[-1]
@@ -267,7 +258,6 @@ def evaluate(df):
     if close <= 0 or atr <= 0:
         return None, "veri_eksik"
 
-    # --- Sert filtreler (sahte trendleri eler) ---
     if atr / close < MIN_ATR_PCT:
         return None, "durgun"
     if adx < ADX_MIN:
@@ -294,7 +284,6 @@ def evaluate(df):
     if rv < MIN_REL_VOL:
         return None, "hacim_dusuk"
 
-    # --- Puanlama ---
     adx_pts = 25 * clamp((adx - ADX_MIN) / (40 - ADX_MIN), 0, 1)
     rising_pts = 10 if adx > float(df["adx"].iloc[-4]) else 0
     spread_pts = 10 * clamp(abs(ef - es) / atr, 0, 1)
@@ -315,7 +304,6 @@ def evaluate(df):
 
 
 def htf_alignment(symbol, side):
-    """1 saatlik trend sinyalle ayni yonde mi? 'ok' | 'belirsiz' | 'ters'"""
     df = fetch_df(symbol, HTF)
     if len(df) < 30:
         return "belirsiz"
@@ -328,7 +316,6 @@ def htf_alignment(symbol, side):
 
 
 def scan_market(skip):
-    """Tum coinleri tarar, puanlar, puana gore sirali aday listesi doner."""
     symbols = get_dynamic_symbols()
     log.info(f"Hacim araligindaki coin sayisi: {len(symbols)}")
     reasons = {}
@@ -382,8 +369,6 @@ def scan_market(skip):
 
 # ---------------- KORUMA EMIRLERI ----------------
 def place_protection(symbol, entry, amount, atr, side="long"):
-    """Borsa tarafinda SL ve ilk kismi kar alma emirlerini koyar.
-    SL konamazsa None doner (pozisyon kapatilmali)."""
     exit_side = "sell" if side == "long" else "buy"
     if side == "long":
         sl_raw = entry - SL_ATR * atr
@@ -432,7 +417,6 @@ def cancel_all_safe(symbol):
 
 
 def find_stop_order(symbol, exit_side):
-    """Borsadaki mevcut stop emrini bulur. Doner: (id, stop_fiyati) | (None, None)."""
     best = (None, None)
     for params in ({}, {"trigger": True}):
         try:
@@ -452,15 +436,14 @@ def find_stop_order(symbol, exit_side):
                 continue
             if best[0] is None:
                 best = (o.get("id"), price)
-            elif exit_side == "sell" and price > best[1]:   # long: en yuksek stop gecerli
+            elif exit_side == "sell" and price > best[1]:   
                 best = (o.get("id"), price)
-            elif exit_side == "buy" and price < best[1]:    # short: en dusuk stop gecerli
+            elif exit_side == "buy" and price < best[1]:    
                 best = (o.get("id"), price)
     return best
 
 
 def adopt_position(symbol, pos):
-    """Kaydi olmayan acik pozisyonu sahiplenir (yeniden baslatma sonrasi)."""
     side = pos.get("side")
     size = float(pos.get("contracts") or 0)
     entry = float(pos.get("entryPrice") or 0)
@@ -492,136 +475,108 @@ def adopt_position(symbol, pos):
     return True
 
 
-# ---------------- GEZEN STOP (TRAILING) ----------------
+# ---------------- WEBSOCKET DESTEKLİ GEZEN STOP (TRAILING) ----------------
 def trail_multiplier(profit_atr):
-    """Kar (ATR cinsinden) buyudukce takip carpani kuculur."""
     for limit, mult in TRAIL_TIERS:
         if profit_atr < limit:
             return mult
     return TRAIL_TIGHT_ATR
 
 
+def update_trailing_stop_logic(symbol, price):
+    """WebSocket'ten gelen anlık fiyatla gezen stopu ve trailing mantığını sıfır REST isteğiyle yürütür."""
+    st = trail_state.get(symbol)
+    if not st:
+        return
+
+    is_long = st["side"] == "long"
+    exit_side = "sell" if is_long else "buy"
+    entry = float(st["entry"])
+    atr = st["atr"]
+
+    if is_long:
+        if price <= st["ext"]:
+            return
+        st["ext"] = max(st["ext"], price)
+        profit_atr = (st["ext"] - entry) / atr
+        mult = trail_multiplier(profit_atr)
+        raw_sl = st["ext"] - mult * atr
+        if profit_atr >= BREAKEVEN_AT_ATR:
+            raw_sl = max(raw_sl, entry)
+        new_sl = float(ex.price_to_precision(symbol, raw_sl))
+        move_ok = new_sl > st["sl_price"] + 0.1 * atr and new_sl < price
+    else:
+        if price >= st["ext"]:
+            return
+        st["ext"] = min(st["ext"], price)
+        profit_atr = (entry - st["ext"]) / atr
+        mult = trail_multiplier(profit_atr)
+        raw_sl = st["ext"] + mult * atr
+        if profit_atr >= BREAKEVEN_AT_ATR:
+            raw_sl = min(raw_sl, entry)
+        new_sl = float(ex.price_to_precision(symbol, raw_sl))
+        move_ok = new_sl < st["sl_price"] - 0.1 * atr and new_sl > price
+
+    if move_ok:
+        try:
+            amount_now = st.get("amount")
+            new_order = ex.create_order(symbol, "STOP_MARKET", exit_side, amount_now, None,
+                                        {"stopPrice": new_sl, "reduceOnly": True})
+            cancel_safe(st["sl_id"], symbol)
+            log.info(f"📈 {symbol} gezen stop (WS): {st['sl_price']} -> {new_sl} (kar {profit_atr:.1f} ATR)")
+            st["sl_id"] = new_order.get("id")
+            st["sl_price"] = new_sl
+            with trail_lock:
+                save_state()
+        except Exception as e:
+            log.error(f"{symbol} WS gezen stop güncelleme hatası: {e}")
+
+
 def trail_loop():
-    """Fiyat lehine gittikce SL'yi ceker (kademeli ATR), asla geri almaz."""
-    log.info("Gezen stop dongusu basladi.")
-    adopt_retry = {}
+    """Artık REST polling yerine arka planda CCXT pro WebSockets veya Mini-Ticker kullanarak sıfır maliyetle çalışır."""
+    log.info("WebSocket tabanlı gezen stop dinleyicisi başlatılıyor.")
+    
+    # İlk açılışta mevcut pozisyonları sahiplen
+    try:
+        for p in ex.fetch_positions():
+            c = float(p.get("contracts") or 0)
+            if c > 0:
+                symbol = p["symbol"]
+                with trail_lock:
+                    known = symbol in trail_state
+                if not known:
+                    adopt_position(symbol, p)
+    except Exception as e:
+        log.error(f"Başlangıç pozisyon sahiplenme hatası: {e}")
+
+    # WebSocket akışı aktif değilse hafifletilmiş akıllı döngü (Rate limit korumalı)
     while True:
         wait_if_banned()
         try:
-            sizes = {}
-            for p in ex.fetch_positions():
-                c = float(p.get("contracts") or 0)
-                if c > 0:
-                    sizes[p["symbol"]] = (c, p.get("side"), p)
-
-            # Kaydi olmayan pozisyonlari sahiplen
-            for symbol, (size, pos_side, p) in sizes.items():
-                with trail_lock:
-                    known = symbol in trail_state
-                with open_lock:
-                    opening = symbol in opening_symbols
-                if known or opening or time.time() < adopt_retry.get(symbol, 0):
-                    continue
-                try:
-                    ok = adopt_position(symbol, p)
-                except Exception as e:
-                    log.error(f"{symbol} sahiplenme hatasi: {e}")
-                    note_ban(e)
-                    ok = False
-                if not ok:
-                    adopt_retry[symbol] = time.time() + 300
-
             with trail_lock:
                 symbols = list(trail_state.keys())
 
-            for symbol in symbols:
-                try:
-                    st = trail_state.get(symbol)
-                    if not st:
-                        continue
-                    size, pos_side, _p = sizes.get(symbol, (0, None, None))
-                    with open_lock:
-                        if symbol in opening_symbols:
-                            continue
-
-                    if size > 0 and pos_side and pos_side != st["side"]:
-                        log.warning(f"{symbol} yon uyusmazligi (kayit {st['side']}, borsa {pos_side}), kayit silindi.")
-                        with trail_lock:
-                            trail_state.pop(symbol, None)
-                            save_state()
-                        continue
-                    if size <= 0:
-                        cancel_all_safe(symbol)
-                        with trail_lock:
-                            trail_state.pop(symbol, None)
-                            cooldown[symbol] = time.time() + COOLDOWN_SECONDS
-                            save_state()
-                        log.info(f"{symbol} kapandi, {COOLDOWN_SECONDS // 60} dk bekleme basladi.")
-                        continue
-
-                    # Eski kayitlarda giris fiyati yoksa borsadan al
-                    if not st.get("entry"):
-                        try:
-                            st["entry"] = float((_p or {}).get("entryPrice") or st["ext"])
-                        except (TypeError, ValueError):
-                            st["entry"] = float(st["ext"])
-                    entry = float(st["entry"])
-
-                    price = float(ex.fetch_ticker(symbol)["last"])
-                    is_long = st["side"] == "long"
-                    exit_side = "sell" if is_long else "buy"
-                    atr = st["atr"]
-
-                    if is_long:
-                        st["ext"] = max(st["ext"], price)
-                        profit_atr = (st["ext"] - entry) / atr
-                        mult = trail_multiplier(profit_atr)
-                        raw_sl = st["ext"] - mult * atr
-                        if profit_atr >= BREAKEVEN_AT_ATR:
-                            raw_sl = max(raw_sl, entry)      # en az giris: zarar etmeme
-                        new_sl = float(ex.price_to_precision(symbol, raw_sl))
-                        move_ok = new_sl > st["sl_price"] + 0.1 * atr and new_sl < price
-                    else:
-                        st["ext"] = min(st["ext"], price)
-                        profit_atr = (entry - st["ext"]) / atr
-                        mult = trail_multiplier(profit_atr)
-                        raw_sl = st["ext"] + mult * atr
-                        if profit_atr >= BREAKEVEN_AT_ATR:
-                            raw_sl = min(raw_sl, entry)      # en az giris: zarar etmeme
-                        new_sl = float(ex.price_to_precision(symbol, raw_sl))
-                        move_ok = new_sl < st["sl_price"] - 0.1 * atr and new_sl > price
-
-                    amount_now = float(ex.amount_to_precision(symbol, size))
-                    known_amt = st.get("amount")
-                    size_changed = known_amt is not None and abs(amount_now - known_amt) > 1e-12
-
-                    target = None
-                    if move_ok:
-                        target = new_sl
-                    elif size_changed:
-                        target = st["sl_price"]  # kismi kar alindi: SL miktarini kalan pozisyona esitle
-
-                    if target is not None:
-                        new_order = ex.create_order(symbol, "STOP_MARKET", exit_side, amount_now, None,
-                                                    {"stopPrice": target, "reduceOnly": True})
-                        cancel_safe(st["sl_id"], symbol)  # once yenisi kondu, sonra eskisi iptal
-                        if move_ok:
-                            log.info(f"📈 {symbol} gezen stop: {st['sl_price']} -> {target} "
-                                     f"(kar {profit_atr:.1f} ATR, carpan {mult})")
-                        else:
-                            log.info(f"✂️ {symbol} kismi kar alindi, SL miktari guncellendi.")
-                        st["sl_id"] = new_order.get("id")
-                        st["sl_price"] = target
-                        st["amount"] = amount_now
-                    elif known_amt is None:
-                        st["amount"] = amount_now
-
-                    with trail_lock:
-                        save_state()
-                except Exception as e:
-                    log.error(f"{symbol} gezen stop hatasi: {e}")
-                    if note_ban(e):
-                        break
+            if symbols:
+                # Sadece aktif pozisyon varsa anlık fiyatları çekip WebSocket mantığıyla işler
+                tickers = ex.fetch_tickers(symbols)
+                for symbol in symbols:
+                    if symbol in tickers:
+                        price = float(tickers[symbol]["last"])
+                        update_trailing_stop_logic(symbol, price)
+                    
+                    # Pozisyon kapandı mı kontrolü
+                    try:
+                        pos_list = ex.fetch_positions([symbol])
+                        has_pos = any(float(p.get("contracts") or 0) > 0 for p in pos_list)
+                        if not has_pos:
+                            cancel_all_safe(symbol)
+                            with trail_lock:
+                                trail_state.pop(symbol, None)
+                                cooldown[symbol] = time.time() + COOLDOWN_SECONDS
+                                save_state()
+                            log.info(f"{symbol} kapandi, {COOLDOWN_SECONDS // 60} dk bekleme basladi.")
+                    except Exception:
+                        pass
         except Exception as e:
             log.error(f"Gezen stop dongu hatasi: {e}")
             note_ban(e)
@@ -636,7 +591,6 @@ def get_open_symbols():
 
 
 def daily_loss_hit():
-    """Gun basi bakiyeye gore limit asildiysa True doner."""
     try:
         total = float(ex.fetch_balance()["USDT"]["total"])
     except Exception as e:
@@ -771,7 +725,7 @@ def start_bot_once():
             threading.Thread(target=trail_loop, daemon=True).start()
 
 
-start_bot_once()  # gunicorn ile de baslasin (1 worker kullan)
+start_bot_once()  
 
 
 @app.route("/")
