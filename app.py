@@ -3,7 +3,7 @@ Binance USDT-M Futures botu (7/24) - TREND PUANLAMALI TARAMA
 - 20M-800M hacim araligindaki TUM coinler taranir (12 coin siniri yok)
 - Her coin 0-100 trend puani alir, en yuksek puanli coin(ler)e girilir
 - ADX + hacim + EMA acilimi + kirilim + ust zaman dilimi uyumu ile sahte trendler elenir
-- LONG + SHORT, ATR stop-loss, kismi kar al, gezen stop, stop sonrasi bekleme, gunluk zarar limiti
+- LONG + SHORT, ATR stop-loss, kismi kar al, KADEMELI ATR gezen stop, stop sonrasi bekleme, gunluk zarar limiti
 - Render'da yeniden baslarsa acik pozisyonlari sahiplenir (borsadaki stop'u bulup gezen stopu surdurur)
 """
 import os
@@ -50,7 +50,13 @@ MAX_OPEN = 3
 SL_ATR = 1.5               # Stop-loss: giris -/+ 1.5 x ATR
 TP1_ATR = 2.0              # Ilk kar al: giris +/- 2 x ATR
 TP1_CLOSE_PCT = 0.50       # ilk kar alda pozisyonun %50'si kapanir, kalan gezen stopla gider
-TRAIL_ATR = 1.5            # Gezen stop mesafesi (giristeki ATR x 1.5)
+
+# --- Kademeli gezen stop (kar buyudukce daralir) ---
+# Kar (ATR cinsinden) -> takip carpani. Kar sinirin altindaysa o carpan kullanilir.
+TRAIL_TIERS = ((1.0, 3.0), (2.0, 2.0))   # kar < 1 ATR: 3x | kar 1-2 ATR: 2x
+TRAIL_TIGHT_ATR = 1.2      # kar 2 ATR'yi gecince en dar takip (1.2 x ATR)
+BREAKEVEN_AT_ATR = 1.0     # kar bu kadar ATR olunca stop en az girise cekilir (zarar etmeme)
+
 TRAIL_CHECK_SECONDS = 20
 COOLDOWN_SECONDS = 2 * 3600   # bir coin kapaninca bu sure tekrar girilmez
 DAILY_LOSS_LIMIT_PCT = 10.0   # gun basi bakiyeye gore bu kadar zarar olursa gun sonuna kadar yeni islem yok
@@ -478,7 +484,7 @@ def adopt_position(symbol, pos):
     ext = max(entry, price) if side == "long" else min(entry, price)
     with trail_lock:
         trail_state[symbol] = {
-            "side": side, "atr": atr, "ext": ext, "sl_price": sl_price,
+            "side": side, "atr": atr, "ext": ext, "entry": entry, "sl_price": sl_price,
             "sl_id": sl_id, "amount": float(ex.amount_to_precision(symbol, size)),
         }
         save_state()
@@ -487,8 +493,16 @@ def adopt_position(symbol, pos):
 
 
 # ---------------- GEZEN STOP (TRAILING) ----------------
+def trail_multiplier(profit_atr):
+    """Kar (ATR cinsinden) buyudukce takip carpani kuculur."""
+    for limit, mult in TRAIL_TIERS:
+        if profit_atr < limit:
+            return mult
+    return TRAIL_TIGHT_ATR
+
+
 def trail_loop():
-    """Fiyat lehine gittikce SL'yi ceker, asla geri almaz."""
+    """Fiyat lehine gittikce SL'yi ceker (kademeli ATR), asla geri almaz."""
     log.info("Gezen stop dongusu basladi.")
     adopt_retry = {}
     while True:
@@ -545,17 +559,37 @@ def trail_loop():
                         log.info(f"{symbol} kapandi, {COOLDOWN_SECONDS // 60} dk bekleme basladi.")
                         continue
 
+                    # Eski kayitlarda giris fiyati yoksa borsadan al
+                    if not st.get("entry"):
+                        try:
+                            st["entry"] = float((_p or {}).get("entryPrice") or st["ext"])
+                        except (TypeError, ValueError):
+                            st["entry"] = float(st["ext"])
+                    entry = float(st["entry"])
+
                     price = float(ex.fetch_ticker(symbol)["last"])
                     is_long = st["side"] == "long"
                     exit_side = "sell" if is_long else "buy"
+                    atr = st["atr"]
+
                     if is_long:
                         st["ext"] = max(st["ext"], price)
-                        new_sl = float(ex.price_to_precision(symbol, st["ext"] - TRAIL_ATR * st["atr"]))
-                        move_ok = new_sl > st["sl_price"] + 0.1 * st["atr"] and new_sl < price
+                        profit_atr = (st["ext"] - entry) / atr
+                        mult = trail_multiplier(profit_atr)
+                        raw_sl = st["ext"] - mult * atr
+                        if profit_atr >= BREAKEVEN_AT_ATR:
+                            raw_sl = max(raw_sl, entry)      # en az giris: zarar etmeme
+                        new_sl = float(ex.price_to_precision(symbol, raw_sl))
+                        move_ok = new_sl > st["sl_price"] + 0.1 * atr and new_sl < price
                     else:
                         st["ext"] = min(st["ext"], price)
-                        new_sl = float(ex.price_to_precision(symbol, st["ext"] + TRAIL_ATR * st["atr"]))
-                        move_ok = new_sl < st["sl_price"] - 0.1 * st["atr"] and new_sl > price
+                        profit_atr = (entry - st["ext"]) / atr
+                        mult = trail_multiplier(profit_atr)
+                        raw_sl = st["ext"] + mult * atr
+                        if profit_atr >= BREAKEVEN_AT_ATR:
+                            raw_sl = min(raw_sl, entry)      # en az giris: zarar etmeme
+                        new_sl = float(ex.price_to_precision(symbol, raw_sl))
+                        move_ok = new_sl < st["sl_price"] - 0.1 * atr and new_sl > price
 
                     amount_now = float(ex.amount_to_precision(symbol, size))
                     known_amt = st.get("amount")
@@ -572,7 +606,8 @@ def trail_loop():
                                                     {"stopPrice": target, "reduceOnly": True})
                         cancel_safe(st["sl_id"], symbol)  # once yenisi kondu, sonra eskisi iptal
                         if move_ok:
-                            log.info(f"📈 {symbol} gezen stop: {st['sl_price']} -> {target}")
+                            log.info(f"📈 {symbol} gezen stop: {st['sl_price']} -> {target} "
+                                     f"(kar {profit_atr:.1f} ATR, carpan {mult})")
                         else:
                             log.info(f"✂️ {symbol} kismi kar alindi, SL miktari guncellendi.")
                         st["sl_id"] = new_order.get("id")
@@ -655,7 +690,7 @@ def open_trade(cand, open_symbols):
         if prot:
             with trail_lock:
                 trail_state[symbol] = {
-                    "side": side, "atr": atr, "ext": entry,
+                    "side": side, "atr": atr, "ext": entry, "entry": entry,
                     "sl_price": prot["sl_price"], "sl_id": prot["sl_id"], "amount": amount,
                 }
                 save_state()
