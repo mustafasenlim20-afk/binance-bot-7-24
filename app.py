@@ -8,7 +8,7 @@ Binance USDT-M Futures botu (7/24) - WEBSOCKET VERI + REST SADECE ISLEM
 - ATR stop-loss, kismi kar al, KADEMELI ATR gezen stop, stop sonrasi bekleme, gunluk zarar limiti
 - Render'da yeniden baslarsa acik pozisyonlari sahiplenir
 
-Gerekli paketler (requirements.txt): ccxt, pandas, flask, gunicorn, websocket-client
+Gerekli paketler (requirements.txt): ccxt, pandas, flask, gunicorn  (websocket icin EK PAKET GEREKMEZ)
 """
 import os
 import re
@@ -16,16 +16,16 @@ import json
 import time
 import logging
 import threading
-from urllib.parse import urlparse
+import socket
+import ssl
+import base64
+import hashlib
+import struct
+from urllib.parse import urlparse, unquote
 
 import ccxt
 import pandas as pd
 from flask import Flask, jsonify
-
-try:
-    import websocket  # pip paketi adi: websocket-client
-except ImportError:
-    websocket = None
 
 app = Flask(__name__)
 
@@ -75,12 +75,16 @@ STATE_FILE = "bot_state.json"
 TESTNET = False
 
 # --- WebSocket / istek ayarlari ---
-WS_URL = "wss://fstream.binance.com/stream"
+# Binance futures websocket adresleri yonlendirmeli: fiyat ve mum akislari /market altinda.
+# Ikinci adres eski (legacy) adres, sadece yedek olarak denenir.
+WS_URLS = ["wss://fstream.binance.com/market/stream", "wss://fstream.binance.com/stream"]
+WS_IDLE_RECONNECT = 30      # WS bagli ama bu kadar sn hic mesaj gelmezse yeniden baglan
+MAX_STREAMS = 300           # tek baglantida en fazla bu kadar coinin mum akisi istenir
 KLINE_KEEP = 150            # her coin icin bellekte tutulan mum sayisi
 SEED_LIMIT = 100            # acilista REST'ten cekilen gecmis mum sayisi
 SEED_SLEEP = 0.5            # gecmis mum cekerken coinler arasi bekleme (sn)
 WS_STALE_SECONDS = 45       # WS'ten bu kadar sn veri gelmezse "calismiyor" sayilir
-KLINE_STALE_SECONDS = 180   # bir coinin mumu bu kadar sn guncellenmezse bayat sayilir
+KLINE_STALE_SECONDS = 600   # bir coinin mumu bu kadar sn guncellenmezse bayat sayilir
 TRAIL_TICK_SECONDS = 2      # WS aciksa gezen stop kontrol sikligi (REST istegi atmaz)
 TRAIL_CHECK_SECONDS = 20    # WS yoksa REST yedek kontrol sikligi
 POSITION_SYNC_SECONDS = 60  # pozisyon kapandi mi kontrolu (tek REST istegi)
@@ -197,19 +201,246 @@ def load_state():
 
 
 # =====================================================================
-#                      WEBSOCKET VERI KATMANI
+#     WEBSOCKET VERI KATMANI  (hicbir paket gerektirmez: sadece Python'un kendi kutuphaneleri)
 # =====================================================================
+class MiniWS:
+    """Kucuk RFC 6455 websocket istemcisi (ws:// ve wss://). Sunucuya paket kurmaya gerek birakmaz."""
+    GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    MAX_FRAME = 32 * 1024 * 1024
+
+    def __init__(self, url, proxy_url=None, ssl_context=None, connect_timeout=15.0, read_timeout=1.0):
+        self.url = url
+        self.proxy_url = proxy_url
+        self.ssl_context = ssl_context
+        self.connect_timeout = connect_timeout
+        self.read_timeout = read_timeout
+        self.sock = None
+        self.buf = bytearray()
+        self.send_lock = threading.Lock()
+        self.frag_data = bytearray()
+
+    @staticmethod
+    def _read_http_head(sock):
+        data = bytearray()
+        while b"\r\n\r\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("sunucu HTTP basligi gelmeden baglantiyi kapatti")
+            data += chunk
+            if len(data) > 65536:
+                raise ConnectionError("HTTP basligi cok buyuk")
+        head, _, rest = bytes(data).partition(b"\r\n\r\n")
+        return head, rest
+
+    @staticmethod
+    def _xor(data, mask):
+        n = len(data)
+        if n == 0:
+            return b""
+        full = (mask * (n // 4 + 1))[:n]
+        return (int.from_bytes(data, "big") ^ int.from_bytes(full, "big")).to_bytes(n, "big")
+
+    def connect(self):
+        u = urlparse(self.url)
+        secure = u.scheme == "wss"
+        host = u.hostname
+        port = u.port or (443 if secure else 80)
+        path = (u.path or "/") + (("?" + u.query) if u.query else "")
+
+        proxy = urlparse(self.proxy_url) if self.proxy_url else None
+        if proxy is not None and (not proxy.hostname or proxy.scheme.startswith("socks")):
+            proxy = None        # socks desteklenmiyor: dogrudan baglanmayi dene
+
+        if proxy is not None:
+            sock = socket.create_connection((proxy.hostname, proxy.port or 8080), timeout=self.connect_timeout)
+            req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+            if proxy.username:
+                cred = f"{unquote(proxy.username)}:{unquote(proxy.password or '')}".encode()
+                req += "Proxy-Authorization: Basic " + base64.b64encode(cred).decode() + "\r\n"
+            sock.sendall((req + "\r\n").encode())
+            try:
+                head, _ = self._read_http_head(sock)
+            except Exception:
+                sock.close()
+                raise
+            status = head.split(b"\r\n", 1)[0].decode("latin1")
+            if len(status.split()) < 2 or status.split()[1] != "200":
+                sock.close()
+                raise ConnectionError(f"proxy CONNECT reddetti: {status}")
+        else:
+            sock = socket.create_connection((host, port), timeout=self.connect_timeout)
+
+        try:
+            if secure:
+                ctx = self.ssl_context or ssl.create_default_context()
+                sock = ctx.wrap_socket(sock, server_hostname=host)
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+            key = base64.b64encode(os.urandom(16)).decode()
+            host_hdr = host if port in (80, 443) else f"{host}:{port}"
+            sock.sendall((
+                f"GET {path} HTTP/1.1\r\nHost: {host_hdr}\r\nUpgrade: websocket\r\n"
+                f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                f"Sec-WebSocket-Version: 13\r\nUser-Agent: Mozilla/5.0\r\n\r\n"
+            ).encode())
+            head, rest = self._read_http_head(sock)
+            lines = head.decode("latin1").split("\r\n")
+            status = lines[0]
+            parts = status.split()
+            if len(parts) < 2 or parts[1] != "101":
+                body = rest[:200].decode("utf-8", "replace").strip()
+                raise ConnectionError(f"el sikisma reddedildi: {status} {body}")
+            headers = {}
+            for ln in lines[1:]:
+                if ":" in ln:
+                    k, v = ln.split(":", 1)
+                    headers[k.strip().lower()] = v.strip()
+            expect = base64.b64encode(hashlib.sha1(key.encode() + self.GUID).digest()).decode()
+            if headers.get("sec-websocket-accept") != expect:
+                raise ConnectionError("el sikisma dogrulanamadi (Sec-WebSocket-Accept)")
+            self.buf = bytearray(rest)      # basliktan sonra gelmis olabilecek ilk cerceve baytlari
+            sock.settimeout(self.read_timeout)
+            self.sock = sock
+        except Exception:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            raise
+
+    def _fill(self):
+        try:
+            chunk = self.sock.recv(65536)
+        except socket.timeout:
+            return False
+        except ssl.SSLWantReadError:
+            return False
+        if not chunk:
+            raise ConnectionError("sunucu baglantiyi kapatti")
+        self.buf += chunk
+        return True
+
+    def _frame(self):
+        b = self.buf
+        if len(b) < 2:
+            return None
+        b1, b2 = b[0], b[1]
+        fin = bool(b1 & 0x80)
+        op = b1 & 0x0F
+        masked = bool(b2 & 0x80)
+        ln = b2 & 0x7F
+        pos = 2
+        if ln == 126:
+            if len(b) < 4:
+                return None
+            ln = struct.unpack(">H", bytes(b[2:4]))[0]
+            pos = 4
+        elif ln == 127:
+            if len(b) < 10:
+                return None
+            ln = struct.unpack(">Q", bytes(b[2:10]))[0]
+            pos = 10
+        mask = b""
+        if masked:
+            if len(b) < pos + 4:
+                return None
+            mask = bytes(b[pos:pos + 4])
+            pos += 4
+        if ln > self.MAX_FRAME:
+            raise ConnectionError("cerceve cok buyuk")
+        if len(b) < pos + ln:
+            return None
+        payload = bytes(b[pos:pos + ln])
+        del b[:pos + ln]
+        if masked:
+            payload = self._xor(payload, mask)
+        return fin, op, payload
+
+    def _send(self, op, payload=b""):
+        n = len(payload)
+        hdr = bytearray([0x80 | op])
+        if n < 126:
+            hdr.append(0x80 | n)
+        elif n < 65536:
+            hdr.append(0x80 | 126)
+            hdr += struct.pack(">H", n)
+        else:
+            hdr.append(0x80 | 127)
+            hdr += struct.pack(">Q", n)
+        mask = os.urandom(4)
+        data = bytes(hdr) + mask + self._xor(payload, mask)
+        with self.send_lock:
+            self.sock.sendall(data)
+
+    def send_pong(self):
+        self._send(0xA, b"")
+
+    def send_text(self, text):
+        self._send(0x1, text.encode())
+
+    def recv(self):
+        """Tam bir mesaj (metin) dondurur. Veri yoksa ~1 sn sonra None doner."""
+        while True:
+            fr = self._frame()
+            if fr is None:
+                if not self._fill():
+                    return None
+                continue
+            fin, op, payload = fr
+            if op == 0x9:               # ping -> pong
+                self._send(0xA, payload)
+                continue
+            if op == 0xA:               # pong
+                continue
+            if op == 0x8:               # close
+                try:
+                    self._send(0x8, payload[:2])
+                except Exception:
+                    pass
+                raise ConnectionError("sunucu baglantiyi kapatti (close)")
+            if op in (0x1, 0x2):
+                self.frag_data = bytearray(payload)
+            elif op == 0x0:
+                self.frag_data += payload
+            else:
+                continue
+            if fin:
+                data = bytes(self.frag_data)
+                self.frag_data = bytearray()
+                return data.decode("utf-8", "replace")
+
+    def close(self):
+        s = self.sock
+        self.sock = None
+        if s is None:
+            return
+        try:
+            self.sock = s
+            self._send(0x8, b"")
+        except Exception:
+            pass
+        self.sock = None
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
 ws_lock = threading.Lock()
 tickers = {}          # "BTCUSDT" -> {"price": float, "vol": float(24s quote hacim)}
 tickers_ts = 0.0      # son WS ticker mesaji zamani
+first_tick_ts = 0.0   # ilk WS ticker mesaji zamani
 klines = {}           # "BTCUSDT" -> [[t, o, h, l, c, v, kapandi_mi], ...]
 kline_ts = {}         # "BTCUSDT" -> son guncelleme zamani
 dirty = set()         # mum boslugu olan (yeniden yuklenmesi gereken) coinler
-subscribed = set()    # kline'ina abone olunan coinler
-ws_app = None
+subscribed = set()    # mum akisi istenen coinler
 ws_connected = False
 rest_ticker_ts = 0.0
 COLS = ["timestamp", "open", "high", "low", "close", "volume", "closed"]
+STABLE_BASES = {"USDC", "BUSD", "FDUSD", "TUSD", "USDP", "DAI", "EUR", "AEUR", "EURI", "USD1", "XUSD"}
+START_TS = time.time()
 
 
 def to_raw(symbol):
@@ -222,45 +453,26 @@ def to_ccxt(raw):
     return f"{raw[:-4]}/USDT:USDT"
 
 
-START_TS = time.time()
-
-
 def ws_healthy():
-    return bool(websocket) and ws_connected and (time.time() - tickers_ts) < WS_STALE_SECONDS
+    """Fiyat akisi taze mi? (kisa kopmalarda onbellekteki fiyat kullanilmaya devam eder)"""
+    return (time.time() - tickers_ts) < WS_STALE_SECONDS
 
 
-def wait_for_ws(timeout=25):
-    """Bot yeni acildiysa websocket'in baglanmasini bekler (ilk tarama bos yere REST yedege dusmesin)."""
-    if websocket is None or time.time() - START_TS > 180:
+def wait_for_ws(timeout=30):
+    """Bot yeni acildiysa websocket'in veri almasini bekler (ilk tarama bos yere REST yedege dusmesin)."""
+    if time.time() - START_TS > 300:
         return
     t0 = time.time()
-    while not ws_healthy() and time.time() - t0 < timeout:
+    while time.time() - t0 < timeout:
+        if ws_healthy() and first_tick_ts and time.time() - first_tick_ts >= 8:
+            return
         time.sleep(1)
 
 
-def ws_on_open(*args):
-    global ws_connected
-    ws_connected = True
-    log.info("✅ WebSocket baglandi.")
-    with ws_lock:
-        params = ["!miniTicker@arr"] + [f"{s.lower()}@kline_{TIMEFRAME}" for s in subscribed]
-    ws_send_subscribe(params)
-
-
-def ws_on_close(*args):
-    global ws_connected
-    ws_connected = False
-    log.warning("WebSocket koptu, yeniden baglanilacak.")
-
-
-def ws_on_error(*args):
-    log.error(f"WebSocket hatasi: {args[-1] if args else '?'}")
-
-
-def ws_on_message(*args):
-    global tickers_ts
+def ws_on_message(text):
+    global tickers_ts, first_tick_ts
     try:
-        msg = json.loads(args[-1])
+        msg = json.loads(text)
     except Exception:
         return
     if not isinstance(msg, dict):
@@ -279,6 +491,8 @@ def ws_on_message(*args):
                 except (KeyError, ValueError, TypeError):
                     continue
             tickers_ts = now
+            if not first_tick_ts:
+                first_tick_ts = now
 
     elif "@kline_" in stream:
         try:
@@ -297,65 +511,74 @@ def ws_on_message(*args):
             elif row[0] > arr[-1][0]:
                 if row[0] - arr[-1][0] > TF_MS * 1.5:
                     dirty.add(raw)           # arada mum kacti, REST ile yeniden yuklenecek
+                arr[-1][6] = True            # yeni mum geldiyse onceki kapanmistir
                 arr.append(row)
                 if len(arr) > KLINE_KEEP:
                     del arr[0]
             kline_ts[raw] = time.time()
 
 
-def ws_send_subscribe(params):
-    app_ = ws_app
-    if app_ is None or not ws_connected or not params:
-        return
-    try:
-        for i in range(0, len(params), 50):
-            app_.send(json.dumps({
-                "method": "SUBSCRIBE",
-                "params": params[i:i + 50],
-                "id": int(time.time() * 1000) % 1_000_000_000,
-            }))
-            time.sleep(0.15)     # Binance: saniyede en fazla 10 mesaj
-    except Exception as e:
-        log.error(f"WS abonelik gonderilemedi: {e}")
-
-
-def ws_proxy_kwargs():
-    if not PROXY_URL:
-        return {}
-    u = urlparse(PROXY_URL)
-    kw = {
-        "http_proxy_host": u.hostname,
-        "http_proxy_port": u.port,
-        "proxy_type": "socks5" if u.scheme.startswith("socks") else "http",
-    }
-    if u.username:
-        kw["http_proxy_auth"] = (u.username, u.password or "")
-    return kw
+def ws_build_url(base):
+    """Binance 'birlesik akis' adresi: fiyat akisi + istenen coinlerin mum akislari."""
+    with ws_lock:
+        syms = sorted(subscribed)
+    streams = ["!miniTicker@arr"] + [f"{r.lower()}@kline_{TIMEFRAME}" for r in syms]
+    return f"{base}?streams={'/'.join(streams)}", set(syms)
 
 
 def ws_thread():
-    """Surekli calisir; kopunca kendini yeniden baglar."""
-    global ws_app, ws_connected
-    if websocket is None:
-        log.error("❌ 'websocket-client' paketi yok! requirements.txt'ye ekle. REST yedek modunda calisacak.")
-        return
+    """Surekli calisir; kopunca ya da yeni coin eklenince kendini yeniden baglar."""
+    global ws_connected
+    idx = 0
     fails = 0
     while True:
+        base = WS_URLS[idx % len(WS_URLS)]
+        url, conn_syms = ws_build_url(base)
         started = time.time()
+        got_data = False
+        client = None
         try:
-            ws_app = websocket.WebSocketApp(
-                WS_URL,
-                on_open=ws_on_open,
-                on_message=ws_on_message,
-                on_error=ws_on_error,
-                on_close=ws_on_close,
-            )
-            ws_app.run_forever(ping_interval=20, ping_timeout=10, **ws_proxy_kwargs())
+            client = MiniWS(url, proxy_url=PROXY_URL)
+            client.connect()
+            ws_connected = True
+            log.info(f"✅ WebSocket baglandi: {base} (1 fiyat akisi + {len(conn_syms)} mum akisi)")
+            last_rx = time.time()
+            last_pong = last_rx
+            while True:
+                msg = client.recv()
+                now = time.time()
+                if msg is not None:
+                    last_rx = now
+                    if not got_data:
+                        got_data = True
+                        log.info("📡 WebSocket veri akisi basladi.")
+                    ws_on_message(msg)
+                elif now - last_rx > WS_IDLE_RECONNECT:
+                    raise ConnectionError(f"{WS_IDLE_RECONNECT} sn boyunca veri gelmedi")
+                if now - last_pong > 60:
+                    client.send_pong()       # istenmemis pong'a Binance izin veriyor (baglantiyi canli tutar)
+                    last_pong = now
+                with ws_lock:
+                    missing = len(subscribed - conn_syms)
+                if missing and now - started > 15:
+                    log.info(f"WebSocket yeni coin akislari icin yeniden baglaniyor (+{missing} coin).")
+                    break
+                if now - started > 23 * 3600:      # Binance baglantiyi 24 saatte keser
+                    break
         except Exception as e:
-            log.error(f"WebSocket dongu hatasi: {e}")
-        ws_connected = False
-        fails = 0 if time.time() - started > 60 else min(fails + 1, 6)
-        time.sleep(min(5 * (fails + 1), 60))
+            log.error(f"WebSocket hatasi ({base}): {type(e).__name__}: {e}")
+        finally:
+            ws_connected = False
+            if client is not None:
+                client.close()
+
+        if got_data:
+            fails = 0
+            time.sleep(1)
+        else:
+            fails += 1
+            idx += 1                                # diger adresi dene
+            time.sleep(min(3 * fails, 30))
 
 
 # ---------------- Coin listesi (WS onbellekten) ----------------
@@ -366,7 +589,7 @@ def symbols_from_cache():
     for raw, t in snap.items():
         if not raw.endswith("USDT"):
             continue
-        if any(s in raw for s in ["USDC", "BUSD", "FDUSD", "TUSD"]):
+        if raw[:-4] in STABLE_BASES:       # 'in' ile parca aramak BNB, TRB gibi coinleri de eliyordu
             continue
         if 0 < t["price"] <= MAX_COIN_PRICE and MIN_VOLUME <= t["vol"] <= MAX_VOLUME:
             valid[to_ccxt(raw)] = t["vol"]
@@ -426,11 +649,13 @@ def is_fresh(raw):
 
 
 def ensure_streams(symbols):
+    """Yeni coinlerin mum akislarini kaydeder; websocket kendini yeniden baglayarak bunlari ekler."""
     with ws_lock:
         new = [to_raw(s) for s in symbols if to_raw(s) not in subscribed]
+        new = new[:max(0, MAX_STREAMS - len(subscribed))]
         subscribed.update(new)
     if new:
-        ws_send_subscribe([f"{r.lower()}@kline_{TIMEFRAME}" for r in new])
+        log.info(f"{len(new)} coin icin mum akisi isteniyor.")
 
 
 def seed_symbol(symbol):
@@ -441,7 +666,14 @@ def seed_symbol(symbol):
     if rows:
         rows[-1][6] = False       # sonuncu mum henuz olusuyor
     with ws_lock:
-        klines[raw] = rows
+        existing = klines.get(raw, [])
+        if rows:
+            last_t = rows[-1][0]
+            same = [r for r in existing if r[0] == last_t]
+            if same:
+                rows[-1] = same[-1]                       # WS'teki surum daha tazedir
+            rows = rows + [r for r in existing if r[0] > last_t]
+        klines[raw] = rows[-KLINE_KEEP:]
         kline_ts[raw] = time.time()
         dirty.discard(raw)
 
@@ -1115,6 +1347,8 @@ def index():
     return jsonify({
         "status": "running",
         "websocket": ws_healthy(),
+        "websocket_bagli": ws_connected,
+        "fiyat_yasi_sn": round(time.time() - tickers_ts, 1) if tickers_ts else None,
         "izlenen_coin": len(subscribed),
         "takip_edilen": list(trail_state.keys()),
         "bekleyen_coin": len(cooldown),
