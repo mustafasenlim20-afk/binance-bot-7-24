@@ -92,7 +92,29 @@ HTF_CACHE_SECONDS = 600     # 1s verisi bu sure onbellekte tutulur
 FALLBACK_MAX_COINS = 30     # WS yoksa REST yedek modunda taranacak en fazla coin
 FALLBACK_SLEEP = 0.5        # REST yedek modunda coinler arasi bekleme (sn)
 REST_TICKER_MIN_GAP = 120   # WS yoksa coin listesi REST'ten en az bu aralikla cekilir
-# ===================================================
+# ===================== TEKİL KOPYA KİLİDİ (LOCK) =====================
+LOCK_FILE = "bot.lock"
+lock_fd = None
+
+def acquire_lock():
+    global lock_fd
+    lock_fd = open(LOCK_FILE, "w")
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_fd.write(str(os.getpid()))
+        lock_fd.flush()
+    except IOError as e:
+        if e.errno in (errno.EACCES, errno.EAGAIN):
+            log.error("⛔ KRİTİK: Botun başka bir kopyası zaten çalışıyor! Bu kopya kapatılıyor.")
+            sys.exit(0)
+        raise
+
+acquire_lock()
 
 logging.basicConfig(
     level=logging.INFO,
