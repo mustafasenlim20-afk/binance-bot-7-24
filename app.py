@@ -1021,9 +1021,9 @@ def _raw_type(o):
     return str(o.get("type") or "").upper()
 
 
-def find_stop_orders(symbol, exit_side):
-    """Borsadaki bu yone ait STOP-LOSS emirlerini [(id, fiyat), ...] verir (kar al emirleri sayilmaz)."""
-    found = {}
+def scan_exit_orders(symbol, exit_side):
+    """Borsadaki bu yone ait cikis emirlerini TEK taramada okur: ([(id, fiyat) stop-loss], [(id, fiyat) kar-al])."""
+    stops, tps = {}, {}
     for params in ({}, {"trigger": True}):
         try:
             orders = ex.fetch_open_orders(symbol, params=params)
@@ -1035,9 +1035,8 @@ def find_stop_orders(symbol, exit_side):
                 continue
             info = o.get("info") or {}
             raw = _raw_type(o)
-            if raw.startswith("TAKE_PROFIT"):
-                continue
-            if not (raw.startswith("STOP") or o.get("stopLossPrice")):
+            is_tp = raw.startswith("TAKE_PROFIT")
+            if not (is_tp or raw.startswith("STOP") or o.get("stopLossPrice")):
                 continue
             price = (o.get("stopLossPrice") or o.get("stopPrice") or o.get("triggerPrice")
                      or info.get("stopPrice") or info.get("triggerPrice"))
@@ -1047,8 +1046,13 @@ def find_stop_orders(symbol, exit_side):
                 continue
             if price <= 0 or o.get("id") is None:
                 continue
-            found[o["id"]] = price
-    return list(found.items())
+            (tps if is_tp else stops)[o["id"]] = price
+    return list(stops.items()), list(tps.items())
+
+
+def find_stop_orders(symbol, exit_side):
+    """Borsadaki bu yone ait STOP-LOSS emirlerini [(id, fiyat), ...] verir (kar al emirleri sayilmaz)."""
+    return scan_exit_orders(symbol, exit_side)[0]
 
 
 def dedupe_stops(symbol):
@@ -1059,7 +1063,14 @@ def dedupe_stops(symbol):
         if not st:
             return
         exit_side = "sell" if st["side"] == "long" else "buy"
-    stops = find_stop_orders(symbol, exit_side)           # REST, kilidin disinda
+    stops, tps = scan_exit_orders(symbol, exit_side)      # REST, kilidin disinda (tek tarama)
+
+    # Bot bir pozisyon icin en fazla 1 kar-al emri koyar; fazlasi eski/artik emirdir (iki kar-al = pozisyonun tamami kapanir)
+    if len(tps) > 1:
+        tps.sort(key=lambda x: str(x[0]).zfill(20))        # id'ler artar: en yeniyi tut
+        removed_tp = sum(1 for oid, _ in tps[:-1] if cancel_safe(oid, symbol))
+        log.info(f"🧹 {symbol}: {len(tps)} kar-al emri bulundu, {removed_tp} fazla kar-al iptal edildi.")
+
     if len(stops) <= 1:
         return
     keep_id, keep_price = (max if exit_side == "sell" else min)(stops, key=lambda x: x[1])
@@ -1349,6 +1360,9 @@ def open_trade(cand, open_symbols):
     with open_lock:
         opening_symbols.add(symbol)
     try:
+        # Bu coinde pozisyon yok (tarama bunu garanti eder): onceki islemden kalan artik stop/kar-al emirleri varsa temizle,
+        # yoksa yeni pozisyona yanlislikla eski emirler (ornegin ikinci bir kar-al) baglanir.
+        cancel_all_safe(symbol)
         try:
             ex.set_margin_mode("isolated", symbol)
         except Exception:
