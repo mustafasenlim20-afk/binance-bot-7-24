@@ -7,6 +7,9 @@ Binance USDT-M Futures botu (7/24) - WEBSOCKET VERI + REST SADECE ISLEM
 - 20M-800M hacim araligindaki TUM coinler taranir, 0-100 trend puani, LONG + SHORT
 - ATR stop-loss, kismi kar al (MARJINE gore %20), KADEMELI ATR gezen stop, stop sonrasi bekleme, gunluk zarar limiti
 - Render'da yeniden baslarsa acik pozisyonlari sahiplenir
+- KAR-AL (TP) GARANTISI: pozisyon basina TAM 1 kar-al emri. Koymadan once borsaya bakilir, koyduktan sonra
+  sayilir, fazlasi iptal edilir. Ilk kar-al dolunca (pozisyon kuculunce) kalan tum kar-al emirleri silinir,
+  boylece ikinci bir kar-al kalan yariyi kapatamaz.
 
 Gerekli paketler (requirements.txt): ccxt, pandas, flask, gunicorn  (websocket icin EK PAKET GEREKMEZ)
 """
@@ -229,6 +232,8 @@ def load_state():
         for st in trail.values():
             st.setdefault("side", "long")
             st.setdefault("ext", st.pop("high", st.get("sl_price", 0)))
+            st.setdefault("orig_amount", st.get("amount", 0))     # kar-al takibi icin ilk miktar
+            st.setdefault("tp_state", "pending")                  # pending: 1 kar-al beklenir | done: hic kar-al kalmamali
         trail_state.update(trail)
         log.info(f"State yuklendi: {list(trail_state.keys())}")
     except Exception:
@@ -955,9 +960,65 @@ def sl_distance(price, atr, lev):
     return min(SL_ATR * atr, cap)
 
 
+def calc_tp_amount(symbol, amount):
+    """Ilk kar alda kapanacak miktar = pozisyonun TP1_CLOSE_PCT'si.
+    Yuvarlama yuzunden miktar yariyi belirgin asarsa (kucuk pozisyonda 'yarisi' = tamami olabilir) 0 doner: TP konmaz,
+    cunku yanlis buyuk bir kar-al pozisyonun tamamini kapatir. Stop-loss yine de aktif kalir."""
+    try:
+        tp_amount = float(ex.amount_to_precision(symbol, amount * TP1_CLOSE_PCT))
+    except Exception as e:
+        log.warning(f"{symbol} kar-al miktari hesaplanamadi: {e}")
+        return 0.0
+    if tp_amount <= 0 or tp_amount > amount * (TP1_CLOSE_PCT + 0.10):
+        return 0.0
+    return tp_amount
+
+
+def place_tp_once(symbol, exit_side, tp_amount, tp_price):
+    """Kar-al emrini TAM BIR KERE koyar.
+    1) Koymadan once borsada bu yonde zaten kar-al var mi bakar; varsa yenisini KOYMAZ.
+    2) Istek zaman asimina ugrarsa emir yine de gitmis olabilir: tekrar gondermeden once borsaya bakar.
+    3) Koyduktan sonra sayar; birden fazla gorurse fazlasini iptal eder.
+    Basarili ise kalan kar-al emrinin id'sini, degilse None dondurur."""
+    existing = scan_exit_orders(symbol, exit_side)[1]
+    if existing:
+        log.warning(f"⚠️ {symbol}: borsada zaten {len(existing)} kar-al emri var, yeni kar-al KONMADI.")
+        return enforce_single_tp(symbol, exit_side)
+
+    try:
+        ex.create_order(symbol, "TAKE_PROFIT_MARKET", exit_side, tp_amount, None,
+                        {"stopPrice": tp_price, "reduceOnly": True})
+    except Exception as e:
+        log.error(f"{symbol} TP gonderilirken hata: {e}")
+        note_ban(e)
+        time.sleep(2)                      # zaman asimiysa emir gitmis olabilir: kontrol et, KORUMASIZCA tekrar gonderme
+        if not scan_exit_orders(symbol, exit_side)[1]:
+            return None
+        log.warning(f"⚠️ {symbol}: hata alindi ama kar-al emri borsada gorunuyor, tekrar gonderilmedi.")
+
+    time.sleep(1)                          # borsa listesine yansisin
+    return enforce_single_tp(symbol, exit_side)
+
+
+def enforce_single_tp(symbol, exit_side):
+    """Borsada bu yonde birden fazla kar-al varsa EN YENISI kalir (id en buyuk), digerleri iptal edilir.
+    Kural sabit oldugu icin iki bot kopyasi calissa bile ikisi de ayni emri tutar, birbirinin emrini silip
+    kar-alsiz birakmaz. Kalan kar-al emrinin id'sini dondurur (yoksa None)."""
+    tps = scan_exit_orders(symbol, exit_side)[1]
+    if not tps:
+        return None
+    tps.sort(key=lambda x: str(x[0]).zfill(20))
+    keep_id = tps[-1][0]
+    if len(tps) > 1:
+        removed = sum(1 for oid, _ in tps[:-1] if cancel_safe(oid, symbol))
+        log.warning(f"🧹 {symbol}: {len(tps)} kar-al emri bulundu (iki kar-al = pozisyonun TAMAMI kapanir!), "
+                    f"{removed} fazla iptal edildi. Birden fazla bot kopyasi calisiyor olabilir!")
+    return keep_id
+
+
 def place_protection(symbol, entry, amount, atr, side="long", lev=1):
     """SL: giris -/+ sl_distance (en fazla 1.5 ATR, marjinde en fazla %SL_MAX_MARGIN_PCT zarar).
-    TP1: marjine gore TP1_MARGIN_PCT kar (fiyat hareketi = pct / kaldirac)."""
+    TP1: marjine gore TP1_MARGIN_PCT kar (fiyat hareketi = pct / kaldirac), pozisyonun %50'si, TAM 1 emir."""
     exit_side = "sell" if side == "long" else "buy"
     tp_move = (TP1_MARGIN_PCT / 100.0) / max(lev, 1)      # fiyatin yuzde kac oynamasi gerek
     sl_dist = sl_distance(entry, atr, lev)
@@ -969,7 +1030,7 @@ def place_protection(symbol, entry, amount, atr, side="long", lev=1):
         tp_raw = entry * (1 - tp_move)
     sl_price = float(ex.price_to_precision(symbol, sl_raw))
     tp_price = float(ex.price_to_precision(symbol, tp_raw))
-    tp_amount = float(ex.amount_to_precision(symbol, amount * TP1_CLOSE_PCT))
+    tp_amount = calc_tp_amount(symbol, amount)
 
     try:
         sl_order = ex.create_order(symbol, "STOP_MARKET", exit_side, amount, None,
@@ -979,15 +1040,18 @@ def place_protection(symbol, entry, amount, atr, side="long", lev=1):
         log.error(f"{symbol} SL konamadi: {e}")
         return None
 
+    tp_id = None
     if tp_amount > 0:
-        try:
-            ex.create_order(symbol, "TAKE_PROFIT_MARKET", exit_side, tp_amount, None,
-                            {"stopPrice": tp_price, "reduceOnly": True})
+        tp_id = place_tp_once(symbol, exit_side, tp_amount, tp_price)
+        if tp_id is not None:
             log.info(f"🎯 TP kondu (%{TP1_CLOSE_PCT*100:.0f} kapanir, marjinde %{TP1_MARGIN_PCT:.0f}): "
-                     f"{symbol} @ {tp_price}")
-        except Exception as e:
-            log.error(f"{symbol} TP konamadi: {e}")
-    return {"sl_id": sl_order.get("id"), "sl_price": sl_price}
+                     f"{symbol} @ {tp_price} miktar={tp_amount}")
+        else:
+            log.error(f"{symbol} TP konamadi")
+    else:
+        log.warning(f"{symbol}: kar-al miktari uygun degil (yuvarlama), TP konmadi. SL aktif.")
+    return {"sl_id": sl_order.get("id"), "sl_price": sl_price,
+            "tp_id": tp_id, "tp_price": tp_price, "tp_amount": tp_amount}
 
 
 def cancel_safe(order_id, symbol):
@@ -1022,8 +1086,9 @@ def _raw_type(o):
 
 
 def scan_exit_orders(symbol, exit_side):
-    """Borsadaki bu yone ait cikis emirlerini TEK taramada okur: ([(id, fiyat) stop-loss], [(id, fiyat) kar-al])."""
-    stops, tps = {}, {}
+    """Borsadaki bu yone ait cikis emirlerini TEK taramada okur.
+    Dondurur: ([(id, fiyat) stop-loss], [(id, fiyat) kar-al], {id: miktar})."""
+    stops, tps, amounts = {}, {}, {}
     for params in ({}, {"trigger": True}):
         try:
             orders = ex.fetch_open_orders(symbol, params=params)
@@ -1047,7 +1112,15 @@ def scan_exit_orders(symbol, exit_side):
             if price <= 0 or o.get("id") is None:
                 continue
             (tps if is_tp else stops)[o["id"]] = price
-    return list(stops.items()), list(tps.items())
+            try:
+                amt = o.get("amount")
+                if amt is None:
+                    amt = info.get("origQty") or info.get("quantity")
+                if amt is not None:
+                    amounts[o["id"]] = float(amt)
+            except (TypeError, ValueError):
+                pass
+    return list(stops.items()), list(tps.items()), amounts
 
 
 def find_stop_orders(symbol, exit_side):
@@ -1056,21 +1129,52 @@ def find_stop_orders(symbol, exit_side):
 
 
 def dedupe_stops(symbol):
-    """Borsada bu pozisyon icin birden fazla stop-loss varsa (zaman asimi, iki kopya vb. nedenle),
-    en yakin (en siki) olani tutar, fazlalari iptal eder ve takip edilen stopu ona esitler. Kar-al emirlerine dokunmaz."""
+    """Her dakika calisir. (1) KAR-AL: pozisyon basina en fazla 1 kar-al; ilk kar-al dolduysa hic kalmasin;
+    kar-al miktari yariyi asiyorsa duzelt. (2) STOP-LOSS: birden fazla varsa en siki olani tut, fazlasini iptal et."""
     with trail_lock:
         st = trail_state.get(symbol)
         if not st:
             return
         exit_side = "sell" if st["side"] == "long" else "buy"
-    stops, tps = scan_exit_orders(symbol, exit_side)      # REST, kilidin disinda (tek tarama)
+        tp_state = st.get("tp_state", "pending")
+        orig = float(st.get("orig_amount") or 0)
+        cur = float(st.get("amount") or 0)
+    stops, tps, amounts = scan_exit_orders(symbol, exit_side)      # REST, kilidin disinda (tek tarama)
 
-    # Bot bir pozisyon icin en fazla 1 kar-al emri koyar; fazlasi eski/artik emirdir (iki kar-al = pozisyonun tamami kapanir)
-    if len(tps) > 1:
-        tps.sort(key=lambda x: str(x[0]).zfill(20))        # id'ler artar: en yeniyi tut
-        removed_tp = sum(1 for oid, _ in tps[:-1] if cancel_safe(oid, symbol))
-        log.info(f"🧹 {symbol}: {len(tps)} kar-al emri bulundu, {removed_tp} fazla kar-al iptal edildi.")
+    # ---------- KAR-AL EMIRLERI ----------
+    # Pozisyon ilk miktarin %90'inin altina indiyse ilk kar-al gerceklesmistir.
+    if tp_state != "done" and orig > 0 and 0 < cur < orig * 0.9:
+        tp_state = "done"
+        with trail_lock:
+            cu = trail_state.get(symbol)
+            if cu:
+                cu["tp_state"] = "done"
+                save_state()
+        log.info(f"🎯 {symbol}: ilk kar-al gerceklesti ({orig} -> {cur}); bundan sonra hic kar-al emri kalmayacak.")
 
+    if tp_state == "done":
+        if tps:
+            removed_tp = sum(1 for oid, _ in tps if cancel_safe(oid, symbol))
+            log.warning(f"🧹 {symbol}: ilk kar-al tamamlandi ama {len(tps)} kar-al emri kalmisti "
+                        f"(kalan yariyi kapatirdi), {removed_tp} tanesi iptal edildi.")
+    else:
+        if len(tps) > 1:
+            tps.sort(key=lambda x: str(x[0]).zfill(20))        # id'ler artar: en yeniyi tut
+            removed_tp = sum(1 for oid, _ in tps[:-1] if cancel_safe(oid, symbol))
+            log.warning(f"🧹 {symbol}: {len(tps)} kar-al emri bulundu (iki kar-al = pozisyonun TAMAMI kapanir!), "
+                        f"{removed_tp} fazla kar-al iptal edildi. Birden fazla bot kopyasi calisiyor olabilir!")
+            tps = tps[-1:]
+        if tps and orig > 0:
+            # Tek kalan kar-al da cok buyukse (yariyi asiyorsa) pozisyonun fazlasini kapatir: dogru miktarla yeniden koy
+            oid, tpx = tps[0]
+            amt = amounts.get(oid)
+            expected = calc_tp_amount(symbol, orig)
+            if amt is not None and expected > 0 and amt > expected * 1.2:
+                log.warning(f"🧹 {symbol}: kar-al miktari {amt}, olmasi gereken {expected}. Duzeltiliyor.")
+                if cancel_safe(oid, symbol):
+                    place_tp_once(symbol, exit_side, expected, tpx)
+
+    # ---------- STOP-LOSS EMIRLERI ----------
     if len(stops) <= 1:
         return
     keep_id, keep_price = (max if exit_side == "sell" else min)(stops, key=lambda x: x[1])
@@ -1079,10 +1183,10 @@ def dedupe_stops(symbol):
         if oid != keep_id and cancel_safe(oid, symbol):
             removed += 1
     with trail_lock:
-        cur = trail_state.get(symbol)
-        if cur:
-            cur["sl_id"] = keep_id
-            cur["sl_price"] = keep_price
+        cur_st = trail_state.get(symbol)
+        if cur_st:
+            cur_st["sl_id"] = keep_id
+            cur_st["sl_price"] = keep_price
             save_state()
     log.info(f"🧹 {symbol}: {len(stops)} stop bulundu, {removed} fazla stop iptal edildi, kalan SL: {keep_price}")
 
@@ -1099,8 +1203,8 @@ def adopt_position(symbol, pos):
         return False
     price = float(ex.fetch_ticker(symbol)["last"])
     exit_side = "sell" if side == "long" else "buy"
-    stops = find_stop_orders(symbol, exit_side)
-    log.info(f"{symbol}: borsada {len(stops)} stop-loss emri bulundu")
+    stops, tps, _ = scan_exit_orders(symbol, exit_side)
+    log.info(f"{symbol}: borsada {len(stops)} stop-loss, {len(tps)} kar-al emri bulundu")
     sl_id, sl_price = None, None
     if stops:
         # en yakin (en siki) stopu tut, fazlalari temizle
@@ -1129,9 +1233,13 @@ def adopt_position(symbol, pos):
             lev = float(pos.get("leverage") or LEV_NORMAL)
         except (TypeError, ValueError):
             lev = float(LEV_NORMAL)
+        size_amt = float(ex.amount_to_precision(symbol, size))
         trail_state[symbol] = {
             "side": side, "atr": atr, "ext": ext, "entry": entry, "sl_price": sl_price,
-            "sl_id": sl_id, "amount": float(ex.amount_to_precision(symbol, size)), "lev": lev,
+            "sl_id": sl_id, "amount": size_amt, "lev": lev,
+            # Borsada kar-al varsa ilk kar-al henuz dolmamis demektir (1 tane kalir, fazlasi temizlenir).
+            # Yoksa ya doldu ya hic konmadi: bundan sonra yeni kar-al KONMAZ, rastgele gelen kar-al iptal edilir.
+            "orig_amount": size_amt, "tp_state": "pending" if tps else "done",
         }
         save_state()
     log.info(f"🤝 {symbol} ({side}) pozisyonu sahiplenildi, gezen stop surecek. SL: {sl_price}")
@@ -1238,9 +1346,9 @@ def sync_positions(symbols):
                 if st:
                     st["amount"] = float(ex.amount_to_precision(symbol, open_map[symbol]))
             try:
-                dedupe_stops(symbol)          # her dakika: fazladan stop kaldiysa temizle
+                dedupe_stops(symbol)          # her dakika: fazladan kar-al/stop kaldiysa temizle
             except Exception as e:
-                log.warning(f"{symbol} fazla stop temizligi hatasi: {e}")
+                log.warning(f"{symbol} fazla emir temizligi hatasi: {e}")
                 note_ban(e)
         else:
             cancel_all_safe(symbol)
@@ -1269,7 +1377,7 @@ def trail_loop():
         log.error(f"Baslangic pozisyon sahiplenme hatasi: {e}")
         note_ban(e)
 
-    last_sync = time.time()
+    last_sync = 0.0        # acilista hemen bir temizlik turu: restart sonrasi kalan fazla kar-al/stop silinsin
     while True:
         interval = TRAIL_TICK_SECONDS
         try:
@@ -1393,6 +1501,8 @@ def open_trade(cand, open_symbols):
                     "side": side, "atr": atr, "ext": entry, "entry": entry,
                     "sl_price": prot["sl_price"], "sl_id": prot["sl_id"], "amount": amount,
                     "lev": lev,
+                    "orig_amount": amount,
+                    "tp_state": "pending" if prot.get("tp_id") is not None else "done",
                 }
                 save_state()
         else:
