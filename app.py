@@ -1051,6 +1051,31 @@ def find_stop_orders(symbol, exit_side):
     return list(found.items())
 
 
+def dedupe_stops(symbol):
+    """Borsada bu pozisyon icin birden fazla stop-loss varsa (zaman asimi, iki kopya vb. nedenle),
+    en yakin (en siki) olani tutar, fazlalari iptal eder ve takip edilen stopu ona esitler. Kar-al emirlerine dokunmaz."""
+    with trail_lock:
+        st = trail_state.get(symbol)
+        if not st:
+            return
+        exit_side = "sell" if st["side"] == "long" else "buy"
+    stops = find_stop_orders(symbol, exit_side)           # REST, kilidin disinda
+    if len(stops) <= 1:
+        return
+    keep_id, keep_price = (max if exit_side == "sell" else min)(stops, key=lambda x: x[1])
+    removed = 0
+    for oid, _ in stops:
+        if oid != keep_id and cancel_safe(oid, symbol):
+            removed += 1
+    with trail_lock:
+        cur = trail_state.get(symbol)
+        if cur:
+            cur["sl_id"] = keep_id
+            cur["sl_price"] = keep_price
+            save_state()
+    log.info(f"🧹 {symbol}: {len(stops)} stop bulundu, {removed} fazla stop iptal edildi, kalan SL: {keep_price}")
+
+
 def adopt_position(symbol, pos):
     side = pos.get("side")
     size = float(pos.get("contracts") or 0)
@@ -1201,6 +1226,11 @@ def sync_positions(symbols):
                 st = trail_state.get(symbol)
                 if st:
                     st["amount"] = float(ex.amount_to_precision(symbol, open_map[symbol]))
+            try:
+                dedupe_stops(symbol)          # her dakika: fazladan stop kaldiysa temizle
+            except Exception as e:
+                log.warning(f"{symbol} fazla stop temizligi hatasi: {e}")
+                note_ban(e)
         else:
             cancel_all_safe(symbol)
             with trail_lock:
