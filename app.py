@@ -5,13 +5,15 @@ Binance USDT-M Futures botu (7/24) - WEBSOCKET VERI + REST SADECE ISLEM
 - Acilista her coinin gecmis mumlari REST'ten BIR KEZ cekilir (yavas, aralikli), sonrasi hep WebSocket
 - WebSocket calismazsa: kontrollu REST yedek modu (az coin, yavas, ban korumali)
 - 20M-800M hacim araligindaki TUM coinler taranir, 0-100 trend puani, LONG + SHORT
-- ATR stop-loss, kismi kar al, KADEMELI ATR gezen stop, stop sonrasi bekleme, gunluk zarar limiti
+- ATR stop-loss, kismi kar al (MARJINE gore %20), KADEMELI ATR gezen stop, stop sonrasi bekleme, gunluk zarar limiti
 - Render'da yeniden baslarsa acik pozisyonlari sahiplenir
 
 Gerekli paketler (requirements.txt): ccxt, pandas, flask, gunicorn  (websocket icin EK PAKET GEREKMEZ)
 """
 import os
 import re
+import sys
+import errno
 import json
 import time
 import logging
@@ -28,6 +30,15 @@ import pandas as pd
 from flask import Flask, jsonify
 
 app = Flask(__name__)
+
+# ===================== LOG =====================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler()],
+    force=True,
+)
+log = logging.getLogger("bot")
 
 # ===================== AYARLAR =====================
 TIMEFRAME = "15m"          # ana zaman dilimi
@@ -58,13 +69,17 @@ LEV_STRONG = 5             # puan >= STRONG_SCORE
 MARGIN_PCT = 0.30          # bos bakiyenin %30'u marjin
 MAX_OPEN = 3
 SL_ATR = 1.5               # Stop-loss: giris -/+ 1.5 x ATR
-TP1_ATR = 2.0              # Ilk kar al: giris +/- 2 x ATR
+SL_MAX_MARGIN_PCT = 10.0   # ...ama stop marjinde en fazla bu kadar zarar ettirecek yerde olur (volatil coinde stop cok uzaga dusmesin)
+TP1_MARGIN_PCT = 20.0      # Ilk kar al: MARJINE gore %20 kar (fiyat hareketi = 20 / kaldirac %)
 TP1_CLOSE_PCT = 0.50       # ilk kar alda pozisyonun %50'si kapanir, kalan gezen stopla gider
 
-# --- Kademeli gezen stop (kar buyudukce daralir) ---
+# --- Kademeli gezen stop (kar buyudukce daralir, ATR'ye baglidir) ---
 # Kar (ATR cinsinden) -> takip carpani. Kar sinirin altindaysa o carpan kullanilir.
-TRAIL_TIERS = ((1.0, 3.0), (2.0, 2.0))   # kar < 1 ATR: 3x | kar 1-2 ATR: 2x
+# Gezen stop islem acilir acilmaz fiyati izler: ilk kademede takip mesafesi SL ile ayni (1.5 ATR),
+# yani fiyat yukseldikce stop hemen arkasindan gelir (3x gibi gevsek bir bekleme yok).
+TRAIL_TIERS = ((2.0, SL_ATR),)           # kar < 2 ATR: 1.5x ATR takip
 TRAIL_TIGHT_ATR = 1.2      # kar 2 ATR'yi gecince en dar takip (1.2 x ATR)
+TRAIL_DIST_MARGIN_PCT = 3.0   # stop, fiyatin en fazla marjinde bu kadar gerisinde durur (fiyat hareketi = pct / kaldirac %). Pozisyon acildigi andan itibaren hep gecerli
 BREAKEVEN_AT_ATR = 1.0     # kar bu kadar ATR olunca stop en az girise cekilir (zarar etmeme)
 
 COOLDOWN_SECONDS = 2 * 3600   # bir coin kapaninca bu sure tekrar girilmez
@@ -92,13 +107,15 @@ HTF_CACHE_SECONDS = 600     # 1s verisi bu sure onbellekte tutulur
 FALLBACK_MAX_COINS = 30     # WS yoksa REST yedek modunda taranacak en fazla coin
 FALLBACK_SLEEP = 0.5        # REST yedek modunda coinler arasi bekleme (sn)
 REST_TICKER_MIN_GAP = 120   # WS yoksa coin listesi REST'ten en az bu aralikla cekilir
+
 # ===================== TEKİL KOPYA KİLİDİ (LOCK) =====================
 LOCK_FILE = "bot.lock"
 lock_fd = None
 
+
 def acquire_lock():
     global lock_fd
-    lock_fd = open(LOCK_FILE, "w")
+    lock_fd = open(LOCK_FILE, "a+")
     try:
         if os.name == 'nt':
             import msvcrt
@@ -106,23 +123,18 @@ def acquire_lock():
         else:
             import fcntl
             fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_fd.seek(0)
+        lock_fd.truncate()
         lock_fd.write(str(os.getpid()))
         lock_fd.flush()
-    except IOError as e:
+    except (IOError, OSError) as e:
         if e.errno in (errno.EACCES, errno.EAGAIN):
             log.error("⛔ KRİTİK: Botun başka bir kopyası zaten çalışıyor! Bu kopya kapatılıyor.")
             sys.exit(0)
         raise
 
-acquire_lock()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[logging.StreamHandler()],
-    force=True,
-)
-log = logging.getLogger("bot")
+acquire_lock()
 
 PROXY_URL = os.getenv("PROXY_URL")
 PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
@@ -196,6 +208,7 @@ open_lock = threading.Lock()
 
 
 def save_state():
+    """DIKKAT: cagiran taraf trail_lock'u tutuyor olmali."""
     try:
         with open(STATE_FILE, "w") as f:
             json.dump({"trail": trail_state, "cooldown": cooldown, "day": day_state}, f)
@@ -936,14 +949,24 @@ def scan_market(skip):
 
 
 # ---------------- KORUMA EMIRLERI ----------------
-def place_protection(symbol, entry, amount, atr, side="long"):
+def sl_distance(price, atr, lev):
+    """Stop mesafesi: SL_ATR x ATR, ama marjinde SL_MAX_MARGIN_PCT zarari gecmeyecek kadar (hangisi yakinsa)."""
+    cap = price * (SL_MAX_MARGIN_PCT / 100.0) / max(float(lev), 1.0)
+    return min(SL_ATR * atr, cap)
+
+
+def place_protection(symbol, entry, amount, atr, side="long", lev=1):
+    """SL: giris -/+ sl_distance (en fazla 1.5 ATR, marjinde en fazla %SL_MAX_MARGIN_PCT zarar).
+    TP1: marjine gore TP1_MARGIN_PCT kar (fiyat hareketi = pct / kaldirac)."""
     exit_side = "sell" if side == "long" else "buy"
+    tp_move = (TP1_MARGIN_PCT / 100.0) / max(lev, 1)      # fiyatin yuzde kac oynamasi gerek
+    sl_dist = sl_distance(entry, atr, lev)
     if side == "long":
-        sl_raw = entry - SL_ATR * atr
-        tp_raw = entry + TP1_ATR * atr
+        sl_raw = entry - sl_dist
+        tp_raw = entry * (1 + tp_move)
     else:
-        sl_raw = entry + SL_ATR * atr
-        tp_raw = entry - TP1_ATR * atr
+        sl_raw = entry + sl_dist
+        tp_raw = entry * (1 - tp_move)
     sl_price = float(ex.price_to_precision(symbol, sl_raw))
     tp_price = float(ex.price_to_precision(symbol, tp_raw))
     tp_amount = float(ex.amount_to_precision(symbol, amount * TP1_CLOSE_PCT))
@@ -960,7 +983,8 @@ def place_protection(symbol, entry, amount, atr, side="long"):
         try:
             ex.create_order(symbol, "TAKE_PROFIT_MARKET", exit_side, tp_amount, None,
                             {"stopPrice": tp_price, "reduceOnly": True})
-            log.info(f"🎯 TP kondu (%{TP1_CLOSE_PCT*100:.0f} kapanir): {symbol} @ {tp_price}")
+            log.info(f"🎯 TP kondu (%{TP1_CLOSE_PCT*100:.0f} kapanir, marjinde %{TP1_MARGIN_PCT:.0f}): "
+                     f"{symbol} @ {tp_price}")
         except Exception as e:
             log.error(f"{symbol} TP konamadi: {e}")
     return {"sl_id": sl_order.get("id"), "sl_price": sl_price}
@@ -1051,7 +1075,12 @@ def adopt_position(symbol, pos):
         if extra:
             log.info(f"🧹 {symbol}: {len(extra)} fazla stop temizlendi")
     if sl_id is None:
-        raw = price - SL_ATR * atr if side == "long" else price + SL_ATR * atr
+        try:
+            lev_pos = float(pos.get("leverage") or LEV_NORMAL)
+        except (TypeError, ValueError):
+            lev_pos = float(LEV_NORMAL)
+        d = sl_distance(price, atr, lev_pos)
+        raw = price - d if side == "long" else price + d
         sl_price = float(ex.price_to_precision(symbol, raw))
         amount = float(ex.amount_to_precision(symbol, size))
         order = ex.create_order(symbol, "STOP_MARKET", exit_side, amount, None,
@@ -1060,9 +1089,13 @@ def adopt_position(symbol, pos):
         log.warning(f"🛟 {symbol} stop'suz pozisyon bulundu, SL kondu @ {sl_price}")
     ext = max(entry, price) if side == "long" else min(entry, price)
     with trail_lock:
+        try:
+            lev = float(pos.get("leverage") or LEV_NORMAL)
+        except (TypeError, ValueError):
+            lev = float(LEV_NORMAL)
         trail_state[symbol] = {
             "side": side, "atr": atr, "ext": ext, "entry": entry, "sl_price": sl_price,
-            "sl_id": sl_id, "amount": float(ex.amount_to_precision(symbol, size)),
+            "sl_id": sl_id, "amount": float(ex.amount_to_precision(symbol, size)), "lev": lev,
         }
         save_state()
     log.info(f"🤝 {symbol} ({side}) pozisyonu sahiplenildi, gezen stop surecek. SL: {sl_price}")
@@ -1078,54 +1111,79 @@ def trail_multiplier(profit_atr):
 
 
 def update_trailing_stop_logic(symbol, price):
-    """Anlik fiyatla gezen stopu hesaplar. REST'e SADECE stop gercekten tasinacaksa gider."""
-    st = trail_state.get(symbol)
-    if not st:
-        return
-
-    is_long = st["side"] == "long"
-    exit_side = "sell" if is_long else "buy"
-    entry = float(st["entry"])
-    atr = st["atr"]
-
-    if is_long:
-        if price <= st["ext"]:
+    """Anlik fiyatla gezen stopu hesaplar. REST'e SADECE stop gercekten tasinacaksa gider.
+    Paylasilan state trail_lock altinda okunur/yazilir; REST cagrilari kilidin DISINDA yapilir."""
+    with trail_lock:
+        st = trail_state.get(symbol)
+        if not st:
             return
-        st["ext"] = max(st["ext"], price)
-        profit_atr = (st["ext"] - entry) / atr
-        mult = trail_multiplier(profit_atr)
-        raw_sl = st["ext"] - mult * atr
-        if profit_atr >= BREAKEVEN_AT_ATR:
-            raw_sl = max(raw_sl, entry)
-        new_sl = float(ex.price_to_precision(symbol, raw_sl))
-        move_ok = new_sl > st["sl_price"] + 0.1 * atr and new_sl < price
-    else:
-        if price >= st["ext"]:
-            return
-        st["ext"] = min(st["ext"], price)
-        profit_atr = (entry - st["ext"]) / atr
-        mult = trail_multiplier(profit_atr)
-        raw_sl = st["ext"] + mult * atr
-        if profit_atr >= BREAKEVEN_AT_ATR:
-            raw_sl = min(raw_sl, entry)
-        new_sl = float(ex.price_to_precision(symbol, raw_sl))
-        move_ok = new_sl < st["sl_price"] - 0.1 * atr and new_sl > price
 
-    if move_ok:
-        wait_if_banned()
+        is_long = st["side"] == "long"
+        exit_side = "sell" if is_long else "buy"
+        entry = float(st["entry"])
+        atr = st["atr"]
+
+        lev = float(st.get("lev") or LEV_NORMAL)
+        if is_long:
+            if price <= st["ext"]:
+                return
+            st["ext"] = max(st["ext"], price)
+            profit_atr = (st["ext"] - entry) / atr
+            mult = trail_multiplier(profit_atr)
+            dist = min(mult * atr, st["ext"] * TRAIL_DIST_MARGIN_PCT / 100.0 / lev)
+            raw_sl = st["ext"] - dist
+            if profit_atr >= BREAKEVEN_AT_ATR:
+                raw_sl = max(raw_sl, entry)
+            new_sl = float(ex.price_to_precision(symbol, raw_sl))
+            move_ok = new_sl > st["sl_price"] + 0.1 * atr and new_sl < price
+        else:
+            if price >= st["ext"]:
+                return
+            st["ext"] = min(st["ext"], price)
+            profit_atr = (entry - st["ext"]) / atr
+            mult = trail_multiplier(profit_atr)
+            dist = min(mult * atr, st["ext"] * TRAIL_DIST_MARGIN_PCT / 100.0 / lev)
+            raw_sl = st["ext"] + dist
+            if profit_atr >= BREAKEVEN_AT_ATR:
+                raw_sl = min(raw_sl, entry)
+            new_sl = float(ex.price_to_precision(symbol, raw_sl))
+            move_ok = new_sl < st["sl_price"] - 0.1 * atr and new_sl > price
+
+        if not move_ok:
+            return
+        old_sl_id = st["sl_id"]
+        old_sl_price = st["sl_price"]
+        amount_now = st.get("amount")
+
+    # ---- kilit disinda: REST islemleri ----
+    wait_if_banned()
+    try:
+        # Kismi kar alindiysa pozisyon kuculmustur: stopu GUNCEL miktarla koy (sadece stop tasirken 1 istek)
         try:
-            amount_now = st.get("amount")
-            new_order = ex.create_order(symbol, "STOP_MARKET", exit_side, amount_now, None,
-                                        {"stopPrice": new_sl, "reduceOnly": True})
-            cancel_safe(st["sl_id"], symbol)
-            log.info(f"📈 {symbol} gezen stop: {st['sl_price']} -> {new_sl} (kar {profit_atr:.1f} ATR)")
-            st["sl_id"] = new_order.get("id")
-            st["sl_price"] = new_sl
-            with trail_lock:
-                save_state()
+            for p in ex.fetch_positions([symbol]):
+                if p.get("symbol") == symbol:
+                    c = float(p.get("contracts") or 0)
+                    if c > 0:
+                        amount_now = float(ex.amount_to_precision(symbol, c))
+                    break
         except Exception as e:
-            log.error(f"{symbol} gezen stop guncelleme hatasi: {e}")
+            log.warning(f"{symbol} guncel pozisyon miktari okunamadi, eski miktar kullanilacak: {e}")
             note_ban(e)
+
+        new_order = ex.create_order(symbol, "STOP_MARKET", exit_side, amount_now, None,
+                                    {"stopPrice": new_sl, "reduceOnly": True})
+        cancel_safe(old_sl_id, symbol)
+        log.info(f"📈 {symbol} gezen stop: {old_sl_price} -> {new_sl} (kar {profit_atr:.1f} ATR)")
+        with trail_lock:
+            cur = trail_state.get(symbol)
+            if cur is st:
+                cur["sl_id"] = new_order.get("id")
+                cur["sl_price"] = new_sl
+                cur["amount"] = amount_now
+                save_state()
+    except Exception as e:
+        log.error(f"{symbol} gezen stop guncelleme hatasi: {e}")
+        note_ban(e)
 
 
 def sync_positions(symbols):
@@ -1239,6 +1297,22 @@ def daily_loss_hit():
     return False
 
 
+def emergency_close(symbol, side, amount):
+    """SL konamayan pozisyonu kapatir; 3 kez dener. Basarisizsa True/False doner."""
+    close_side = "sell" if side == "long" else "buy"
+    for attempt in range(1, 4):
+        try:
+            wait_if_banned()
+            ex.create_order(symbol, "market", close_side, amount, None, {"reduceOnly": True})
+            log.warning(f"🔒 {symbol} korumasiz pozisyon kapatildi (deneme {attempt}).")
+            return True
+        except Exception as e:
+            log.error(f"{symbol} acil kapatma hatasi (deneme {attempt}/3): {e}")
+            note_ban(e)
+            time.sleep(2)
+    return False
+
+
 def open_trade(cand, open_symbols):
     symbol, side, atr = cand["symbol"], cand["side"], cand["atr"]
     lev = LEV_STRONG if cand["score"] >= STRONG_SCORE else LEV_NORMAL
@@ -1268,19 +1342,28 @@ def open_trade(cand, open_symbols):
                  f"Miktar: {amount} | Kaldirac: {lev}x | Giris: {entry}")
         open_symbols.append(symbol)
 
-        prot = place_protection(symbol, entry, amount, atr, side)
+        prot = place_protection(symbol, entry, amount, atr, side, lev)
         if prot:
             with trail_lock:
                 trail_state[symbol] = {
                     "side": side, "atr": atr, "ext": entry, "entry": entry,
                     "sl_price": prot["sl_price"], "sl_id": prot["sl_id"], "amount": amount,
+                    "lev": lev,
                 }
                 save_state()
         else:
             log.error(f"{symbol} SL yok, pozisyon kapatiliyor!")
-            close_side = "sell" if side == "long" else "buy"
-            ex.create_order(symbol, "market", close_side, amount, None, {"reduceOnly": True})
-            open_symbols.remove(symbol)
+            if emergency_close(symbol, side, amount):
+                if symbol in open_symbols:
+                    open_symbols.remove(symbol)
+            else:
+                log.critical(f"🆘 {symbol} pozisyonu KORUMASIZ ve KAPATILAMADI! Sahiplenme (SL koyma) deneniyor. "
+                             f"Gerekirse ELLE mudahale et!")
+                try:
+                    adopt_position(symbol, {"side": side, "contracts": amount, "entryPrice": entry,
+                                            "leverage": lev})
+                except Exception as e:
+                    log.critical(f"🆘 {symbol} sahiplenme de basarisiz: {e} -> HEMEN ELLE KAPAT!")
         return True
     finally:
         with open_lock:
