@@ -10,6 +10,9 @@ Binance USDT-M Futures botu (7/24) - WEBSOCKET VERI + REST SADECE ISLEM
 - KAR-AL (TP) GARANTISI: pozisyon basina TAM 1 kar-al emri. Koymadan once borsaya bakilir, koyduktan sonra
   sayilir, fazlasi iptal edilir. Ilk kar-al dolunca (pozisyon kuculunce) kalan tum kar-al emirleri silinir,
   boylece ikinci bir kar-al kalan yariyi kapatamaz.
+- ROTASYON: pozisyon limiti doluyken, uzun suredir kar/zarar ~0 civarinda sikismis ve kendi yonunde trendi
+  kalmamis "bayat" pozisyon varsa, daha guclu bir trend bulununca bayat pozisyon kapatilip yeni coine girilir.
+- /scan adresi: son tarama adaylarini ve acik pozisyonlarin durumunu (kar %, yas, bayat mi) gosterir.
 
 Gerekli paketler (requirements.txt): ccxt, pandas, flask, gunicorn  (websocket icin EK PAKET GEREKMEZ)
 """
@@ -91,6 +94,16 @@ ALLOW_LONG = True
 ALLOW_SHORT = True
 STATE_FILE = "bot_state.json"
 TESTNET = False
+
+# --- ROTASYON: bayat pozisyonu kapat, guclu trende gir ---
+ROTATE_ENABLED = True
+ROTATE_MIN_AGE_SECONDS = 45 * 60   # pozisyon en az bu kadar suredir acik olmali
+ROTATE_PNL_MIN = -6.0              # marjine gore kar/zarar % bu bandin icindeyse "sikismis" sayilir
+ROTATE_PNL_MAX = 6.0               # (+6'nin ustu kardadir: gezen stop yonetsin, dokunma)
+ROTATE_KEEP_SCORE = 50             # pozisyonun KENDI yonunde trend puani bunun ustundeyse bayat sayilmaz
+ROTATE_MIN_SCORE = 65              # yeni coinin puani en az bu olmali (bosuna girip cikmayi onler)
+ROTATE_GAP_SECONDS = 20 * 60       # iki rotasyon arasi en az bu kadar sure
+ROTATE_MAX_PER_DAY = 6             # gunluk en fazla rotasyon (komisyon korumasi)
 
 # --- WebSocket / istek ayarlari ---
 # Binance futures websocket adresleri yonlendirmeli: fiyat ve mum akislari /market altinda.
@@ -234,6 +247,7 @@ def load_state():
             st.setdefault("ext", st.pop("high", st.get("sl_price", 0)))
             st.setdefault("orig_amount", st.get("amount", 0))     # kar-al takibi icin ilk miktar
             st.setdefault("tp_state", "pending")                  # pending: 1 kar-al beklenir | done: hic kar-al kalmamali
+            st.setdefault("opened_at", time.time())               # rotasyon icin pozisyon yasi (eski kayitta yoksa simdi baslar)
         trail_state.update(trail)
         log.info(f"State yuklendi: {list(trail_state.keys())}")
     except Exception:
@@ -478,6 +492,7 @@ dirty = set()         # mum boslugu olan (yeniden yuklenmesi gereken) coinler
 subscribed = set()    # mum akisi istenen coinler
 ws_connected = False
 rest_ticker_ts = 0.0
+last_scan = {"time": 0.0, "kaynak": "-", "adaylar": []}   # /scan adresi icin son tarama sonucu
 COLS = ["timestamp", "open", "high", "low", "close", "volume", "closed"]
 STABLE_BASES = {"USDC", "BUSD", "FDUSD", "TUSD", "USDP", "DAI", "EUR", "AEUR", "EURI", "USD1", "XUSD"}
 START_TS = time.time()
@@ -876,6 +891,7 @@ def htf_alignment(symbol, side):
 
 
 def scan_market(skip):
+    global last_scan
     wait_for_ws()
     symbols = get_dynamic_symbols()
     tradfi = {s for s in symbols if is_tradfi(s)}
@@ -950,6 +966,13 @@ def scan_market(skip):
     for c in final[:5]:
         log.info(f"  ⭐ {c['symbol']} {c['side'].upper()} puan={c['score']:.0f} adx={c['adx']:.0f} "
                  f"hacimx={c['rv']:.1f} rsi={c['rsi']:.0f} 1s={c['htf']}")
+    last_scan = {
+        "time": time.time(),
+        "kaynak": "WebSocket" if ws_ok else "REST yedek",
+        "adaylar": [{"coin": c["symbol"], "yon": c["side"], "puan": round(c["score"]),
+                     "adx": round(c["adx"]), "hacim_x": round(c["rv"], 1), "rsi": round(c["rsi"]),
+                     "ust_trend": c["htf"]} for c in final[:10]],
+    }
     return [c for c in final if c["score"] >= MIN_TREND_SCORE]
 
 
@@ -1228,6 +1251,13 @@ def adopt_position(symbol, pos):
         sl_id = order.get("id")
         log.warning(f"🛟 {symbol} stop'suz pozisyon bulundu, SL kondu @ {sl_price}")
     ext = max(entry, price) if side == "long" else min(entry, price)
+    opened_at = time.time()
+    try:
+        ut = (pos.get("info") or {}).get("updateTime")      # borsanin son guncelleme zamani (yaklasik pozisyon yasi)
+        if ut:
+            opened_at = min(opened_at, float(ut) / 1000.0)
+    except (TypeError, ValueError):
+        pass
     with trail_lock:
         try:
             lev = float(pos.get("leverage") or LEV_NORMAL)
@@ -1240,6 +1270,7 @@ def adopt_position(symbol, pos):
             # Borsada kar-al varsa ilk kar-al henuz dolmamis demektir (1 tane kalir, fazlasi temizlenir).
             # Yoksa ya doldu ya hic konmadi: bundan sonra yeni kar-al KONMAZ, rastgele gelen kar-al iptal edilir.
             "orig_amount": size_amt, "tp_state": "pending" if tps else "done",
+            "opened_at": opened_at,
         }
         save_state()
     log.info(f"🤝 {symbol} ({side}) pozisyonu sahiplenildi, gezen stop surecek. SL: {sl_price}")
@@ -1446,17 +1477,17 @@ def daily_loss_hit():
     return False
 
 
-def emergency_close(symbol, side, amount):
-    """SL konamayan pozisyonu kapatir; 3 kez dener. Basarisizsa True/False doner."""
+def emergency_close(symbol, side, amount, neden="korumasiz pozisyon"):
+    """Pozisyonu market emriyle (reduceOnly) kapatir; 3 kez dener. Basarili mi diye True/False doner."""
     close_side = "sell" if side == "long" else "buy"
     for attempt in range(1, 4):
         try:
             wait_if_banned()
             ex.create_order(symbol, "market", close_side, amount, None, {"reduceOnly": True})
-            log.warning(f"🔒 {symbol} korumasiz pozisyon kapatildi (deneme {attempt}).")
+            log.warning(f"🔒 {symbol} kapatildi ({neden}, deneme {attempt}).")
             return True
         except Exception as e:
-            log.error(f"{symbol} acil kapatma hatasi (deneme {attempt}/3): {e}")
+            log.error(f"{symbol} kapatma hatasi ({neden}, deneme {attempt}/3): {e}")
             note_ban(e)
             time.sleep(2)
     return False
@@ -1503,6 +1534,7 @@ def open_trade(cand, open_symbols):
                     "lev": lev,
                     "orig_amount": amount,
                     "tp_state": "pending" if prot.get("tp_id") is not None else "done",
+                    "opened_at": time.time(),
                 }
                 save_state()
         else:
@@ -1524,6 +1556,150 @@ def open_trade(cand, open_symbols):
             opening_symbols.discard(symbol)
 
 
+# ---------------- ROTASYON (bayat pozisyonu guclu trendle degistir) ----------------
+rotate_times = []
+rotate_lock = threading.Lock()
+
+
+def position_pnl_margin_pct(st, price):
+    """Pozisyonun marjine gore anlik kar/zarar yuzdesi (komisyon haric). Veri yoksa None."""
+    try:
+        entry = float(st.get("entry") or 0)
+        if entry <= 0 or price <= 0:
+            return None
+        lev = float(st.get("lev") or LEV_NORMAL)
+        move = (price - entry) / entry if st["side"] == "long" else (entry - price) / entry
+        return move * lev * 100.0
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def own_trend_score(symbol, side):
+    """Pozisyondaki coinin KENDI yonundeki trend puani (WS onbellekten, REST yok). Trend yoksa/veri yoksa 0."""
+    try:
+        raw = to_raw(symbol)
+        if not is_fresh(raw):
+            return 0.0
+        df = get_df(symbol)
+        if df is None:
+            return 0.0
+        cand, _ = evaluate(df)
+        if cand and cand["side"] == side:
+            return float(cand["score"])
+    except Exception:
+        pass
+    return 0.0
+
+
+def find_stale_positions():
+    """Bayat pozisyonlar: yeterince eski + marjine gore kar/zarar -/+ bantin icinde + kendi yonunde guclu trend kalmamis.
+    REST istegi atmaz. Dondurur: [(coin, kar%, yas_dk, kendi_puani)], en bayat basta."""
+    if not ws_healthy():
+        return []
+    now = time.time()
+    with trail_lock:
+        snap = {s: dict(st) for s, st in trail_state.items()}
+    stale = []
+    for symbol, st in snap.items():
+        age = now - float(st.get("opened_at") or now)
+        if age < ROTATE_MIN_AGE_SECONDS:
+            continue
+        with ws_lock:
+            t = tickers.get(to_raw(symbol))
+        if not t:
+            continue
+        pnl = position_pnl_margin_pct(st, t["price"])
+        if pnl is None or not (ROTATE_PNL_MIN <= pnl <= ROTATE_PNL_MAX):
+            continue
+        own = own_trend_score(symbol, st["side"])
+        if own >= ROTATE_KEEP_SCORE:
+            continue
+        stale.append((symbol, pnl, age / 60.0, own))
+    stale.sort(key=lambda x: (x[3], -x[2]))       # once trendi en zayif, sonra en eski
+    return stale
+
+
+def close_position_for_rotation(symbol):
+    """Pozisyonu market emriyle kapatir, kalan emirleri siler, durumu temizler. Basarili ise True."""
+    with trail_lock:
+        st = trail_state.get(symbol)
+        if not st:
+            return False
+        side = st["side"]
+    wait_if_banned()
+    amount = None
+    try:
+        for p in ex.fetch_positions([symbol]):
+            if p.get("symbol") == symbol:
+                c = float(p.get("contracts") or 0)
+                if c > 0:
+                    amount = float(ex.amount_to_precision(symbol, c))
+                break
+    except Exception as e:
+        log.error(f"{symbol} rotasyon: pozisyon miktari okunamadi: {e}")
+        note_ban(e)
+        return False
+    if not amount:
+        return False                      # zaten kapanmis: sync_positions temizler
+    if not emergency_close(symbol, side, amount, neden="rotasyon"):
+        return False
+    cancel_all_safe(symbol)
+    with trail_lock:
+        trail_state.pop(symbol, None)
+        cooldown[symbol] = time.time() + COOLDOWN_SECONDS
+        save_state()
+    return True
+
+
+def rotate_if_needed(open_symbols):
+    """Pozisyon limiti doluyken calisir. Bayat pozisyon varsa ve guclu (>= ROTATE_MIN_SCORE) bir trend bulunursa
+    bayati kapatip yeni coine girer. Rotasyon yapildiysa True doner."""
+    if not ROTATE_ENABLED:
+        return False
+    now = time.time()
+    with rotate_lock:
+        rotate_times[:] = [t for t in rotate_times if now - t < 86400]
+        if rotate_times and now - rotate_times[-1] < ROTATE_GAP_SECONDS:
+            return False
+        if len(rotate_times) >= ROTATE_MAX_PER_DAY:
+            return False
+
+    stale = find_stale_positions()
+    if not stale:
+        return False
+    names = ", ".join(f"{s.split('/')[0]} (%{p:+.1f}, {a:.0f} dk, puan {o:.0f})" for s, p, a, o in stale)
+    log.info(f"💤 Bayat pozisyon(lar): {names}. Daha guclu trend araniyor...")
+
+    if daily_loss_hit():
+        return False
+
+    with trail_lock:
+        skip = set(open_symbols) | set(cooldown.keys())
+    candidates = scan_market(skip)
+    strong = [c for c in candidates if c["score"] >= ROTATE_MIN_SCORE]
+    if not strong:
+        log.info(f"Rotasyon icin yeterince guclu trend yok (esik {ROTATE_MIN_SCORE}), bayat pozisyon korunuyor.")
+        return False
+
+    cand = strong[0]
+    symbol, pnl, age_min, own = stale[0]
+    log.info(f"🔄 ROTASYON: {symbol} (%{pnl:+.1f}, {age_min:.0f} dk, puan {own:.0f}) kapatilip "
+             f"{cand['symbol']} {cand['side'].upper()} (puan {cand['score']:.0f}) acilacak.")
+    if not close_position_for_rotation(symbol):
+        log.warning(f"{symbol} rotasyon icin kapatilamadi, yeni islem acilmadi.")
+        return False
+    if symbol in open_symbols:
+        open_symbols.remove(symbol)
+    with rotate_lock:
+        rotate_times.append(time.time())
+    try:
+        open_trade(cand, open_symbols)
+    except Exception as e:
+        log.error(f"{cand['symbol']} rotasyon sonrasi islem acma hatasi: {e}")
+        note_ban(e)
+    return True
+
+
 def bot_loop():
     log.info("Bot arkaplan dongusu basladi.")
     while True:
@@ -1539,6 +1715,11 @@ def bot_loop():
 
             if len(open_symbols) >= MAX_OPEN:
                 log.info(f"Pozisyon limiti dolu ({len(open_symbols)}/{MAX_OPEN}), yeni tarama yapilmadi.")
+                try:
+                    rotate_if_needed(open_symbols)
+                except Exception as e:
+                    log.error(f"Rotasyon hatasi: {e}")
+                    note_ban(e)
                 time.sleep(LOOP_SECONDS)
                 continue
 
@@ -1611,6 +1792,35 @@ def index():
         "izlenen_coin": len(subscribed),
         "takip_edilen": list(trail_state.keys()),
         "bekleyen_coin": len(cooldown),
+    })
+
+
+@app.route("/scan")
+def scan_view():
+    """Son tarama adaylari + acik pozisyonlarin durumu (kar %, yas, rotasyona aday mi)."""
+    now = time.time()
+    with trail_lock:
+        snap = {s: dict(st) for s, st in trail_state.items()}
+    stale_names = {s for s, _, _, _ in find_stale_positions()}
+    pozisyonlar = []
+    for s, st in snap.items():
+        with ws_lock:
+            t = tickers.get(to_raw(s))
+        pnl = position_pnl_margin_pct(st, t["price"]) if t else None
+        pozisyonlar.append({
+            "coin": s,
+            "yon": st.get("side"),
+            "kar_marjin_yuzde": round(pnl, 2) if pnl is not None else None,
+            "yas_dk": round((now - float(st.get("opened_at") or now)) / 60),
+            "bayat": s in stale_names,
+        })
+    return jsonify({
+        "son_tarama_sn_once": round(now - last_scan["time"]) if last_scan["time"] else None,
+        "tarama_kaynagi": last_scan["kaynak"],
+        "adaylar": last_scan["adaylar"],
+        "pozisyonlar": pozisyonlar,
+        "rotasyon_acik": ROTATE_ENABLED,
+        "bugunku_rotasyon": len([t for t in rotate_times if now - t < 86400]),
     })
 
 
