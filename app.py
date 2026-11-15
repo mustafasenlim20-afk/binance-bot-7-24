@@ -9,7 +9,12 @@ Binance USDT-M Futures botu (7/24) - WEBSOCKET VERI + REST SADECE ISLEM
 - Bot acilinca ~12 dk "isinma" yapar (fiyat gecmisi birikir), bu sure islem acmaz.
 - WebSocket calismazsa: kontrollu REST yedek modu (az coin, yavas, ban korumali)
 - 20M-1,5 milyar hacim araligi, 0-100 trend puani, LONG + SHORT
-- ATR stop-loss, kismi kar al (MARJINE gore %20), DARALAN ATR gezen stop, stop sonrasi bekleme, gunluk zarar limiti
+- ATR stop-loss (marjinde en fazla %10 zarar), kismi kar al (MARJINE gore %25, pozisyonun %70'i), DARALAN ATR gezen stop,
+  stop sonrasi bekleme, gunluk zarar limiti (%5)
+- RISK BAZLI POZISYON BOYUTU: her islemde stop olursa hesabin en fazla RISK_PCT'si gider; kaldirac en fazla 3x
+- BTC FILTRESI: BTC son 15 dk'da sert dusuyorsa long, sert cikiyorsa short acilmaz
+- ISLEM GUNLUGU: her acilis/kapanis trades.csv'ye ve loga ("JURNAL" satirlari) yazilir; /journal adresinde ozet gorunur
+- TRADING_ENABLED=0 (ortam degiskeni) ise bot emir vermez, sadece sinyalleri loglar (kagit modu)
 - Render'da yeniden baslarsa acik pozisyonlari sahiplenir
 - KAR-AL (TP) GARANTISI: pozisyon basina TAM 1 kar-al emri. Koymadan once borsaya bakilir, koyduktan sonra
   sayilir, fazlasi iptal edilir. Ilk kar-al dolunca (pozisyon kuculunce) kalan tum kar-al emirleri silinir,
@@ -25,6 +30,7 @@ Gerekli paketler (requirements.txt): ccxt, pandas, flask, gunicorn  (websocket i
 import os
 import re
 import sys
+import csv
 import errno
 import json
 import time
@@ -73,7 +79,7 @@ MAX_MOVE_1H = 0.15               # son 1 saatte %15'ten fazla oynamis coine girm
 
 # --- Trend puani (0-100) ---
 MIN_TREND_SCORE = 50       # bunun altindaki coine girilmez (dusurursen daha cok islem acar)
-STRONG_SCORE = 70          # bu puan ve ustu = guclu trend -> yuksek kaldirac
+STRONG_SCORE = 70          # bu puan ve ustu = guclu trend
 HTF_CHECK_TOP = 10         # ust zaman dilimi teyidi en iyi kac coine yapilsin
 HTF_PTS = 15               # ust zaman dilimi uyumlu ise puan (belirsizse yarisi, ters ise elenir)
 ADX_MIN = 20               # bunun altinda trend yok sayilir
@@ -86,13 +92,14 @@ BREAKOUT_BARS = 12         # kirilim icin bakilan onceki mum sayisi
 
 # --- Islem ---
 LEV_NORMAL = 3             # puan < STRONG_SCORE
-LEV_STRONG = 5             # puan >= STRONG_SCORE
-MARGIN_PCT = 0.30          # bos bakiyenin %30'u marjin
+LEV_STRONG = 3             # puan >= STRONG_SCORE (artik 5x yok: en fazla 3x)
+RISK_PCT = 1.5             # her islemde stop olursa hesabin (toplam bakiye) en fazla %1,5'i gider -> pozisyon boyutu buna gore hesaplanir
+MARGIN_PCT = 0.30          # ...ama marjin hicbir zaman bos bakiyenin %30'unu gecmez (ust sinir)
 MAX_OPEN = 3
-SL_ATR = 2.0               # Stop-loss: giris -/+ 2 x ATR (eskiden 1.5: normal dalgalanmada cok kolay tetikleniyordu)
+SL_ATR = 2.0               # Stop-loss: giris -/+ 2 x ATR
 SL_MAX_MARGIN_PCT = 10.0   # ...ama stop marjinde en fazla bu kadar zarar ettirecek yerde olur (volatil coinde stop cok uzaga dusmesin)
-TP1_MARGIN_PCT = 20.0      # Ilk kar al: MARJINE gore %20 kar (fiyat hareketi = 20 / kaldirac %)
-TP1_CLOSE_PCT = 0.30       # ilk kar alda pozisyonun %50'si kapanir, kalan gezen stopla gider
+TP1_MARGIN_PCT = 25.0      # Ilk kar al: MARJINE gore %25 kar (fiyat hareketi = 25 / kaldirac %)
+TP1_CLOSE_PCT = 0.70       # ilk kar alda pozisyonun %70'i kapanir (marjinde +%17,5 kar, stop en fazla -%10 -> 1,75:1), kalan %30 gezen stopla gider
 
 # --- DARALAN gezen stop (ATR'ye bagli) ---
 # Pozisyon acilinca sadece normal stop-loss (SL_ATR) vardir. Kar TRAIL_START_ATR'ye ulasinca gezen stop devreye girer.
@@ -105,11 +112,25 @@ BREAKEVEN_AT_ATR = 1.5     # kar bu kadar ATR olunca stop en az girise cekilir (
 FEE_BUFFER_PCT = 0.12      # stop girise cekilirken eklenen komisyon payi (fiyatin %'si): giris+cikis komisyonu ~%0,1
 
 COOLDOWN_SECONDS = 2 * 3600   # bir coin kapaninca bu sure tekrar girilmez
-DAILY_LOSS_LIMIT_PCT = 10.0   # gun basi bakiyeye gore bu kadar zarar olursa gun sonuna kadar yeni islem yok
+DAILY_LOSS_LIMIT_PCT = 5.0    # gun basi bakiyeye gore bu kadar zarar olursa gun sonuna kadar yeni islem yok
 ALLOW_LONG = True
 ALLOW_SHORT = True
 STATE_FILE = "bot_state.json"
 TESTNET = False
+
+# Ortam degiskeni TRADING_ENABLED=0 ise bot hic emir vermez, sadece sinyalleri loglar (kagit modu).
+TRADING_ENABLED = os.getenv("TRADING_ENABLED", "1") != "0"
+
+# --- BTC FILTRESI: piyasa yonune ters islem acma ---
+BTC_FILTER_ENABLED = True
+BTC_WINDOW = 15 * 60       # BTC degisimine bakilan pencere (sn)
+BTC_MIN_SPAN = 8 * 60      # pencerede en az bu kadar fiyat gecmisi yoksa filtre calismaz (karar vermez)
+BTC_BLOCK_PCT = 0.5        # BTC pencerede %0,5'ten fazla dusmusse long, fazla cikmissa short acilmaz
+
+# --- ISLEM GUNLUGU ---
+JOURNAL_FILE = "trades.csv"
+JOURNAL_FIELDS = ["time", "event", "symbol", "side", "score", "lev", "entry", "amount", "sl", "tp",
+                  "risk_usdt", "pnl_usdt", "fee_usdt", "net_usdt", "hold_min", "reason"]
 
 # --- ROTASYON: bayat pozisyonu kapat, guclu trende gir ---
 ROTATE_ENABLED = True
@@ -302,6 +323,54 @@ def load_state():
         log.info(f"State yuklendi: {list(trail_state.keys())}")
     except Exception:
         pass
+
+
+# ---------------- ISLEM GUNLUGU (journal) ----------------
+journal_lock = threading.Lock()
+
+
+def journal(event, symbol, **kw):
+    """Her acilis/kapanisi hem loga ('JURNAL' satiri) hem trades.csv'ye yazar.
+    Not: Render ucretsiz planda dosyalar yeniden baslatmada silinebilir; log satirlari ve Binance islem gecmisi yedektir."""
+    row = {"time": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()), "event": event, "symbol": symbol}
+    row.update({k: v for k, v in kw.items() if k in JOURNAL_FIELDS})
+    log.info("📒 JURNAL " + json.dumps(row, ensure_ascii=False))
+    try:
+        with journal_lock:
+            new = not os.path.exists(JOURNAL_FILE)
+            with open(JOURNAL_FILE, "a", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=JOURNAL_FIELDS, extrasaction="ignore")
+                if new:
+                    w.writeheader()
+                w.writerow(row)
+    except Exception as e:
+        log.warning(f"Gunluk dosyaya yazilamadi: {e}")
+
+
+def journal_close(symbol, st, reason):
+    """Kapanan pozisyonun gerceklesen kar/zararini borsadan (tek istek) okuyup gunluge yazar. REST: kilidin disinda cagir."""
+    if not st:
+        return
+    opened_at = float(st.get("opened_at") or time.time())
+    pnl = fee = net = None
+    try:
+        wait_if_banned()
+        trades = ex.fetch_my_trades(symbol, since=int(opened_at * 1000) - 60_000, limit=100)
+        pnl = 0.0
+        fee = 0.0
+        for t in trades:
+            info = t.get("info") or {}
+            pnl += float(info.get("realizedPnl") or 0)
+            fee += float((t.get("fee") or {}).get("cost") or 0)
+        net = pnl - fee
+    except Exception as e:
+        log.warning(f"{symbol} gunluk icin islem gecmisi okunamadi: {e}")
+        note_ban(e)
+    journal("close", symbol, side=st.get("side"), lev=st.get("lev"), entry=st.get("entry"),
+            pnl_usdt=round(pnl, 4) if pnl is not None else "",
+            fee_usdt=round(fee, 4) if fee is not None else "",
+            net_usdt=round(net, 4) if net is not None else "",
+            hold_min=round((time.time() - opened_at) / 60), reason=reason)
 
 
 # =====================================================================
@@ -807,6 +876,25 @@ def mark_hot(symbols):
             hot_ts[to_raw(s)] = now
 
 
+def btc_change_pct():
+    """BTC'nin son BTC_WINDOW sn'deki % degisimi (sadece WS fiyat gecmisi, REST YOK).
+    Yeterli gecmis yoksa None doner (filtre karar vermez)."""
+    with ws_lock:
+        h = list(tick_hist.get("BTCUSDT", ()))
+    if len(h) < 2:
+        return None
+    t_now, p_now, _ = h[-1]
+    target = t_now - BTC_WINDOW
+    ref = None
+    for smp in h:
+        if smp[0] >= target:
+            ref = smp
+            break
+    if ref is None or ref[1] <= 0 or t_now - ref[0] < BTC_MIN_SPAN:
+        return None
+    return (p_now / ref[1] - 1.0) * 100.0
+
+
 # ---------------- Mum verisi ----------------
 def is_fresh(raw):
     with ws_lock:
@@ -1154,7 +1242,19 @@ def scan_market(skip):
                      "adx": round(c["adx"]), "hacim_x": round(c["rv"], 1), "rsi": round(c["rsi"]),
                      "ust_trend": c["htf"]} for c in final[:10]],
     }
-    return [c for c in final if c["score"] >= MIN_TREND_SCORE]
+
+    ready = [c for c in final if c["score"] >= MIN_TREND_SCORE]
+    if BTC_FILTER_ENABLED and ws_ok and ready:
+        btc = btc_change_pct()
+        if btc is not None:
+            kept = [c for c in ready
+                    if not ((c["side"] == "long" and btc <= -BTC_BLOCK_PCT)
+                            or (c["side"] == "short" and btc >= BTC_BLOCK_PCT))]
+            if len(kept) < len(ready):
+                log.info(f"🛡️ BTC filtresi: BTC son {BTC_WINDOW // 60} dk %{btc:+.2f}, "
+                         f"ters yondeki {len(ready) - len(kept)} aday elendi.")
+            ready = kept
+    return ready
 
 
 # ---------------- KORUMA EMIRLERI ----------------
@@ -1572,10 +1672,11 @@ def sync_positions(symbols):
         else:
             cancel_all_safe(symbol)
             with trail_lock:
-                trail_state.pop(symbol, None)
+                closed_st = trail_state.pop(symbol, None)
                 cooldown[symbol] = time.time() + COOLDOWN_SECONDS
                 save_state()
             log.info(f"{symbol} kapandi, {COOLDOWN_SECONDS // 60} dk bekleme basladi.")
+            journal_close(symbol, closed_st, "borsada kapandi (stop / kar-al / gezen stop)")
 
 
 def trail_loop():
@@ -1681,9 +1782,35 @@ def emergency_close(symbol, side, amount, neden="korumasiz pozisyon"):
     return False
 
 
+def min_notional(symbol):
+    """Borsanin bu coin icin en kucuk emir degeri (USDT). Bilgi yoksa 5 varsayilir."""
+    try:
+        m = (ex.markets or {}).get(symbol) or {}
+        c = ((m.get("limits") or {}).get("cost") or {}).get("min")
+        return float(c) if c else 5.0
+    except Exception:
+        return 5.0
+
+
 def open_trade(cand, open_symbols):
     symbol, side, atr = cand["symbol"], cand["side"], cand["atr"]
     lev = LEV_STRONG if cand["score"] >= STRONG_SCORE else LEV_NORMAL
+
+    if not TRADING_ENABLED:
+        # KAGIT MODU: emir verilmez, sadece sinyal ve olasi stop/kar-al seviyeleri loglanir
+        d = sl_distance(cand["price"], atr, lev)
+        sl_p = cand["price"] - d if side == "long" else cand["price"] + d
+        mv = (TP1_MARGIN_PCT / 100.0) / max(lev, 1)
+        tp_p = cand["price"] * (1 + mv) if side == "long" else cand["price"] * (1 - mv)
+        log.info(f"📝 [KAGIT MODU] {side.upper()} {symbol} puan={cand['score']:.0f} fiyat={cand['price']} "
+                 f"SL={sl_p:.8g} TP1={tp_p:.8g} (emir verilmedi)")
+        journal("signal", symbol, side=side, score=round(cand["score"]), lev=lev, entry=cand["price"],
+                sl=round(sl_p, 10), tp=round(tp_p, 10), reason="kagit modu (emir verilmedi)")
+        with trail_lock:
+            cooldown[symbol] = time.time() + 30 * 60        # ayni sinyal her turda tekrar loglanmasin
+            save_state()
+        return False
+
     with open_lock:
         opening_symbols.add(symbol)
     try:
@@ -1699,10 +1826,29 @@ def open_trade(cand, open_symbols):
         except Exception:
             pass
 
-        usdt_free = float(ex.fetch_balance()["USDT"]["free"])
-        amount = float(ex.amount_to_precision(symbol, usdt_free * MARGIN_PCT * lev / cand["price"]))
+        # ---- RISK BAZLI POZISYON BOYUTU ----
+        # Stop olursa kaybedilecek tutar = miktar x stop mesafesi = hesabin RISK_PCT'si olacak sekilde miktar bulunur.
+        # Marjin ust siniri (MARGIN_PCT) yine gecerli: hangisi kucukse o kullanilir.
+        bal = ex.fetch_balance()["USDT"]
+        usdt_free = float(bal["free"])
+        usdt_total = float(bal["total"])
+        sl_dist = sl_distance(cand["price"], atr, lev)
+        if sl_dist <= 0 or usdt_total <= 0:
+            return False
+        risk_usdt = usdt_total * RISK_PCT / 100.0
+        amount_risk = risk_usdt / sl_dist
+        amount_cap = usdt_free * MARGIN_PCT * lev / cand["price"]
+        amount = float(ex.amount_to_precision(symbol, min(amount_risk, amount_cap)))
         if amount <= 0:
             return False
+        min_cost = min_notional(symbol)
+        if amount * cand["price"] < min_cost * 1.02:
+            log.info(f"⏭️ {symbol}: hesaplanan pozisyon degeri {amount * cand['price']:.2f} USDT, borsa en az "
+                     f"{min_cost:.0f} USDT istiyor, bu islem atlandi.")
+            return False
+        real_risk = amount * sl_dist
+        log.info(f"⚖️ {symbol} boyut: risk hedefi {risk_usdt:.2f} USDT, stop mesafesi %{sl_dist / cand['price'] * 100:.2f}, "
+                 f"stop olursa ~{real_risk:.2f} USDT kayip, marjin ~{amount * cand['price'] / lev:.2f} USDT")
 
         if side == "long":
             order = ex.create_market_buy_order(symbol, amount)
@@ -1725,6 +1871,9 @@ def open_trade(cand, open_symbols):
                     "opened_at": time.time(),
                 }
                 save_state()
+            journal("open", symbol, side=side, score=round(cand["score"]), lev=lev, entry=entry, amount=amount,
+                    sl=prot["sl_price"], tp=prot["tp_price"],
+                    risk_usdt=round(amount * abs(entry - prot["sl_price"]), 4))
         else:
             log.error(f"{symbol} SL yok, pozisyon kapatiliyor!")
             if emergency_close(symbol, side, amount):
@@ -1833,16 +1982,17 @@ def close_position_for_rotation(symbol):
         return False
     cancel_all_safe(symbol)
     with trail_lock:
-        trail_state.pop(symbol, None)
+        closed_st = trail_state.pop(symbol, None)
         cooldown[symbol] = time.time() + COOLDOWN_SECONDS
         save_state()
+    journal_close(symbol, closed_st, "rotasyon (bayat pozisyon)")
     return True
 
 
 def rotate_if_needed(open_symbols):
     """Pozisyon limiti doluyken calisir. Bayat pozisyon varsa ve guclu (>= ROTATE_MIN_SCORE) bir trend bulunursa
     bayati kapatip yeni coine girer. Rotasyon yapildiysa True doner."""
-    if not ROTATE_ENABLED:
+    if not ROTATE_ENABLED or not TRADING_ENABLED:
         return False
     now = time.time()
     with rotate_lock:
@@ -1890,6 +2040,8 @@ def rotate_if_needed(open_symbols):
 
 def bot_loop():
     log.info("Bot arkaplan dongusu basladi.")
+    if not TRADING_ENABLED:
+        log.warning("📝 KAGIT MODU: TRADING_ENABLED=0, bot emir vermeyecek, sadece sinyalleri loglayacak.")
     while True:
         wait_if_banned()
         try:
@@ -1975,6 +2127,7 @@ start_bot_once()
 def index():
     return jsonify({
         "status": "running",
+        "emir_veriyor": TRADING_ENABLED,
         "websocket": ws_healthy(),
         "websocket_bagli": ws_connected,
         "fiyat_yasi_sn": round(time.time() - tickers_ts, 1) if tickers_ts else None,
@@ -2003,14 +2156,46 @@ def scan_view():
             "yas_dk": round((now - float(st.get("opened_at") or now)) / 60),
             "bayat": s in stale_names,
         })
+    btc = btc_change_pct()
     return jsonify({
         "son_tarama_sn_once": round(now - last_scan["time"]) if last_scan["time"] else None,
         "tarama_kaynagi": last_scan["kaynak"],
+        "btc_son_15dk_yuzde": round(btc, 2) if btc is not None else None,
         "hareketli": last_scan.get("hareketli", []),
         "adaylar": last_scan["adaylar"],
         "pozisyonlar": pozisyonlar,
         "rotasyon_acik": ROTATE_ENABLED,
         "bugunku_rotasyon": len([t for t in rotate_times if now - t < 86400]),
+    })
+
+
+@app.route("/journal")
+def journal_view():
+    """Kapanan islemlerin ozeti: islem sayisi, kazanma orani, net kar/zarar, islem basi beklenen deger + son kayitlar."""
+    rows = []
+    try:
+        with open(JOURNAL_FILE, newline="") as f:
+            rows = list(csv.DictReader(f))
+    except Exception:
+        pass
+    nets = []
+    for r in rows:
+        if r.get("event") == "close" and r.get("net_usdt") not in (None, ""):
+            try:
+                nets.append(float(r["net_usdt"]))
+            except ValueError:
+                pass
+    wins = [n for n in nets if n > 0]
+    losses = [n for n in nets if n <= 0]
+    return jsonify({
+        "kapanan_islem": len(nets),
+        "kazanan": len(wins),
+        "kazanma_orani_yuzde": round(len(wins) / len(nets) * 100, 1) if nets else None,
+        "net_toplam_usdt": round(sum(nets), 3) if nets else None,
+        "islem_basi_net_usdt": round(sum(nets) / len(nets), 4) if nets else None,
+        "ort_kazanc_usdt": round(sum(wins) / len(wins), 4) if wins else None,
+        "ort_kayip_usdt": round(sum(losses) / len(losses), 4) if losses else None,
+        "son_kayitlar": rows[-30:],
     })
 
 
