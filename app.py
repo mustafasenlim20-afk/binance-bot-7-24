@@ -9,9 +9,10 @@ Binance USDT-M Futures botu (7/24) - WEBSOCKET VERI + REST SADECE ISLEM
 - Bot acilinca ~12 dk "isinma" yapar (fiyat gecmisi birikir), bu sure islem acmaz.
 - WebSocket calismazsa: kontrollu REST yedek modu (az coin, yavas, ban korumali)
 - 20M-1,5 milyar hacim araligi, 0-100 trend puani, LONG + SHORT
-- ATR stop-loss (marjinde en fazla %10 zarar), kismi kar al (MARJINE gore %25, pozisyonun %70'i), DARALAN ATR gezen stop,
+- ATR stop-loss (marjinde en fazla %20 zarar), kismi kar al (MARJINE gore %25, pozisyonun %70'i), DARALAN ATR gezen stop,
   stop sonrasi bekleme, gunluk zarar limiti (%5)
-- RISK BAZLI POZISYON BOYUTU: her islemde stop olursa hesabin en fazla RISK_PCT'si gider; kaldirac en fazla 3x
+- TEK POZISYON (MAX_OPEN=1), 15x kaldirac (coin desteklemezse sirayla 10/8/5/3x denenir)
+- RISK BAZLI POZISYON BOYUTU: her islemde stop olursa hesabin en fazla RISK_PCT'si gider
 - BTC FILTRESI: BTC son 15 dk'da sert dusuyorsa long, sert cikiyorsa short acilmaz
 - ISLEM GUNLUGU: her acilis/kapanis trades.csv'ye ve loga ("JURNAL" satirlari) yazilir; /journal adresinde ozet gorunur
 - TRADING_ENABLED=0 (ortam degiskeni) ise bot emir vermez, sadece sinyalleri loglar (kagit modu)
@@ -91,15 +92,16 @@ MAX_EXT_ATR = 4.0          # fiyat EMA21'den 4 ATR'den fazla uzaksa gec kalinmis
 BREAKOUT_BARS = 12         # kirilim icin bakilan onceki mum sayisi
 
 # --- Islem ---
-LEV_NORMAL = 3             # puan < STRONG_SCORE
-LEV_STRONG = 3             # puan >= STRONG_SCORE (artik 5x yok: en fazla 3x)
-RISK_PCT = 1.5             # her islemde stop olursa hesabin (toplam bakiye) en fazla %1,5'i gider -> pozisyon boyutu buna gore hesaplanir
+LEV_NORMAL = 15            # puan < STRONG_SCORE
+LEV_STRONG = 15            # puan >= STRONG_SCORE
+LEV_FALLBACKS = (10, 8, 5, 3)   # coin 15x'i desteklemezse sirayla bu kaldiraclar denenir
+RISK_PCT = 3.0             # her islemde stop olursa hesabin (toplam bakiye) en fazla %3'u gider -> pozisyon boyutu buna gore hesaplanir
 MARGIN_PCT = 0.30          # ...ama marjin hicbir zaman bos bakiyenin %30'unu gecmez (ust sinir)
-MAX_OPEN = 3
+MAX_OPEN = 1               # ayni anda tek pozisyon
 SL_ATR = 2.0               # Stop-loss: giris -/+ 2 x ATR
-SL_MAX_MARGIN_PCT = 10.0   # ...ama stop marjinde en fazla bu kadar zarar ettirecek yerde olur (volatil coinde stop cok uzaga dusmesin)
+SL_MAX_MARGIN_PCT = 20.0   # ...ama stop marjinde en fazla bu kadar zarar ettirecek yerde olur (volatil coinde stop cok uzaga dusmesin)
 TP1_MARGIN_PCT = 25.0      # Ilk kar al: MARJINE gore %25 kar (fiyat hareketi = 25 / kaldirac %)
-TP1_CLOSE_PCT = 0.70       # ilk kar alda pozisyonun %70'i kapanir (marjinde +%17,5 kar, stop en fazla -%10 -> 1,75:1), kalan %30 gezen stopla gider
+TP1_CLOSE_PCT = 0.70       # ilk kar alda pozisyonun %70'i kapanir (marjinde +%17,5 kar), kalan %30 gezen stopla gider
 
 # --- DARALAN gezen stop (ATR'ye bagli) ---
 # Pozisyon acilinca sadece normal stop-loss (SL_ATR) vardir. Kar TRAIL_START_ATR'ye ulasinca gezen stop devreye girer.
@@ -108,6 +110,8 @@ TRAIL_START_ATR = 1.0      # kar bu kadar ATR olmadan gezen stop calismaz (yon b
 TRAIL_TIERS = ((3.0, 1.5),)   # kar < 3 ATR: 1.5 x ATR geriden takip
 TRAIL_TIGHT_ATR = 1.0      # kar 3 ATR'yi gecince en dar takip (1 x ATR)
 TRAIL_MIN_DIST_PCT = 1.0   # takip mesafesi hicbir zaman fiyatin %1'inden az olmaz (gurultuye takilmamak icin)
+TRAIL_MIN_STEP_ATR = 0.25  # stop en az bu kadar ATR ilerlemeden REST'e gidilmez (gereksiz istek olmasin)
+TRAIL_MIN_INTERVAL = 15    # ayni coinde iki stop guncellemesi arasi en az bu kadar sn
 BREAKEVEN_AT_ATR = 1.5     # kar bu kadar ATR olunca stop en az girise cekilir (zarar etmeme)
 FEE_BUFFER_PCT = 0.12      # stop girise cekilirken eklenen komisyon payi (fiyatin %'si): giris+cikis komisyonu ~%0,1
 
@@ -1572,6 +1576,7 @@ def update_trailing_stop_logic(symbol, price):
     """Anlik fiyatla gezen stopu hesaplar. REST'e SADECE stop gercekten tasinacaksa gider.
     Kar TRAIL_START_ATR'ye ulasmadan stop yerinde kalir (sadece ilk stop-loss). Sonra takip mesafesi
     kar buyudukce daralir (TRAIL_TIERS -> TRAIL_TIGHT_ATR) ve hicbir zaman fiyatin %TRAIL_MIN_DIST_PCT'inden az olmaz.
+    Stop en az TRAIL_MIN_STEP_ATR ilerlemeden ve son guncellemenin uzerinden TRAIL_MIN_INTERVAL sn gecmeden REST'e gidilmez.
     Paylasilan state trail_lock altinda okunur/yazilir; REST cagrilari kilidin DISINDA yapilir."""
     with trail_lock:
         st = trail_state.get(symbol)
@@ -1596,7 +1601,7 @@ def update_trailing_stop_logic(symbol, price):
             if profit_atr >= BREAKEVEN_AT_ATR:
                 raw_sl = max(raw_sl, entry * (1 + FEE_BUFFER_PCT / 100.0))
             new_sl = float(ex.price_to_precision(symbol, raw_sl))
-            move_ok = new_sl > st["sl_price"] + 0.1 * atr and new_sl < price
+            move_ok = new_sl > st["sl_price"] + TRAIL_MIN_STEP_ATR * atr and new_sl < price
         else:
             if price >= st["ext"]:
                 return
@@ -1610,10 +1615,11 @@ def update_trailing_stop_logic(symbol, price):
             if profit_atr >= BREAKEVEN_AT_ATR:
                 raw_sl = min(raw_sl, entry * (1 - FEE_BUFFER_PCT / 100.0))
             new_sl = float(ex.price_to_precision(symbol, raw_sl))
-            move_ok = new_sl < st["sl_price"] - 0.1 * atr and new_sl > price
+            move_ok = new_sl < st["sl_price"] - TRAIL_MIN_STEP_ATR * atr and new_sl > price
 
-        if not move_ok:
+        if not move_ok or time.time() - st.get("last_move_ts", 0) < TRAIL_MIN_INTERVAL:
             return
+        st["last_move_ts"] = time.time()
         old_sl_id = st["sl_id"]
         old_sl_price = st["sl_price"]
         amount_now = st.get("amount")
@@ -1821,10 +1827,25 @@ def open_trade(cand, open_symbols):
             ex.set_margin_mode("isolated", symbol)
         except Exception:
             pass
-        try:
-            ex.set_leverage(lev, symbol)
-        except Exception:
-            pass
+
+        # Kaldirac: once hedef (15x), coin desteklemezse sirayla daha dusuk degerler denenir.
+        # Gercekten ayarlanan kaldirac kullanilir; hic biri ayarlanamazsa islem acilmaz
+        # (aksi halde bot 15x varsayip stopu yanlis hesaplardi).
+        lev_ok = None
+        for try_lev in (lev,) + LEV_FALLBACKS:
+            try:
+                ex.set_leverage(try_lev, symbol)
+                lev_ok = try_lev
+                break
+            except Exception as e:
+                log.warning(f"{symbol} {try_lev}x kaldirac ayarlanamadi: {e}")
+                note_ban(e)
+        if lev_ok is None:
+            log.warning(f"⏭️ {symbol}: kaldirac ayarlanamadi, islem atlandi.")
+            return False
+        if lev_ok != lev:
+            log.info(f"{symbol}: {lev}x desteklenmiyor, {lev_ok}x kullanilacak.")
+        lev = lev_ok
 
         # ---- RISK BAZLI POZISYON BOYUTU ----
         # Stop olursa kaybedilecek tutar = miktar x stop mesafesi = hesabin RISK_PCT'si olacak sekilde miktar bulunur.
@@ -1843,8 +1864,8 @@ def open_trade(cand, open_symbols):
             return False
         min_cost = min_notional(symbol)
         if amount * cand["price"] < min_cost * 1.02:
-            log.info(f"⏭️ {symbol}: hesaplanan pozisyon degeri {amount * cand['price']:.2f} USDT, borsa en az "
-                     f"{min_cost:.0f} USDT istiyor, bu islem atlandi.")
+            log.warning(f"⏭️ {symbol}: hesaplanan pozisyon degeri {amount * cand['price']:.2f} USDT, borsa en az "
+                        f"{min_cost:.0f} USDT istiyor, bu islem atlandi.")
             return False
         real_risk = amount * sl_dist
         log.info(f"⚖️ {symbol} boyut: risk hedefi {risk_usdt:.2f} USDT, stop mesafesi %{sl_dist / cand['price'] * 100:.2f}, "
