@@ -13,6 +13,8 @@ Binance USDT-M Futures botu (7/24) - WEBSOCKET VERI + REST SADECE ISLEM
 - ROTASYON: pozisyon limiti doluyken, uzun suredir kar/zarar ~0 civarinda sikismis ve kendi yonunde trendi
   kalmamis "bayat" pozisyon varsa, daha guclu bir trend bulununca bayat pozisyon kapatilip yeni coine girilir.
 - /scan adresi: son tarama adaylarini ve acik pozisyonlarin durumunu (kar %, yas, bayat mi) gosterir.
+- BAN KORUMASI: 429/418 gelince ustel bekleme (2, 4, 8, 16, 30 dk), ban suresi dosyaya yazilir (yeniden baslatmada korunur),
+  acilistaki gecmis mum yuklemesi her turda en fazla SEED_PER_CYCLE coinle sinirlidir.
 
 Gerekli paketler (requirements.txt): ccxt, pandas, flask, gunicorn  (websocket icin EK PAKET GEREKMEZ)
 """
@@ -62,7 +64,7 @@ STRONG_SCORE = 70          # bu puan ve ustu = guclu trend -> yuksek kaldirac
 HTF_CHECK_TOP = 10         # ust zaman dilimi teyidi en iyi kac coine yapilsin
 HTF_PTS = 15               # ust zaman dilimi uyumlu ise puan (belirsizse yarisi, ters ise elenir)
 ADX_MIN = 20               # bunun altinda trend yok sayilir
-MIN_ATR_PCT = 0.0025       # ATR / fiyat en az %0,25 (cok durgun coinde komisyon yer)
+MIN_ATR_PCT = 0.005        # ATR / fiyat en az %0,5 (cok durgun coinde komisyon yer)
 MIN_REL_VOL = 0.7          # son 3 mum hacmi / onceki 20 mum ortalamasi en az bu olsun
 RSI_MAX_LONG = 75          # long'da RSI bunun ustundeyse trend yorulmus
 RSI_MIN_SHORT = 25         # short'ta RSI bunun altindaysa trend yorulmus
@@ -75,9 +77,9 @@ LEV_STRONG = 5             # puan >= STRONG_SCORE
 MARGIN_PCT = 0.30          # bos bakiyenin %30'u marjin
 MAX_OPEN = 3
 SL_ATR = 1.5               # Stop-loss: giris -/+ 1.5 x ATR
-SL_MAX_MARGIN_PCT = 10.0   # ...ama stop marjinde en fazla bu kadar zarar ettirecek yerde olur (volatil coinde stop cok uzaga dusmesin)
+SL_MAX_MARGIN_PCT = 5.0    # ...ama stop marjinde en fazla bu kadar zarar ettirecek yerde olur (volatil coinde stop cok uzaga dusmesin)
 TP1_MARGIN_PCT = 20.0      # Ilk kar al: MARJINE gore %20 kar (fiyat hareketi = 20 / kaldirac %)
-TP1_CLOSE_PCT = 0.50       # ilk kar alda pozisyonun %50'si kapanir, kalan gezen stopla gider
+TP1_CLOSE_PCT = 0.30       # ilk kar alda pozisyonun %50'si kapanir, kalan gezen stopla gider
 
 # --- Kademeli gezen stop (kar buyudukce daralir, ATR'ye baglidir) ---
 # Kar (ATR cinsinden) -> takip carpani. Kar sinirin altindaysa o carpan kullanilir.
@@ -87,6 +89,7 @@ TRAIL_TIERS = ((2.0, SL_ATR),)           # kar < 2 ATR: 1.5x ATR takip
 TRAIL_TIGHT_ATR = 1.2      # kar 2 ATR'yi gecince en dar takip (1.2 x ATR)
 TRAIL_DIST_MARGIN_PCT = 3.0   # stop, fiyatin en fazla marjinde bu kadar gerisinde durur (fiyat hareketi = pct / kaldirac %). Pozisyon acildigi andan itibaren hep gecerli
 BREAKEVEN_AT_ATR = 1.0     # kar bu kadar ATR olunca stop en az girise cekilir (zarar etmeme)
+FEE_BUFFER_PCT = 0.12      # stop girise cekilirken eklenen komisyon payi (fiyatin %'si): giris+cikis komisyonu ~%0,1
 
 COOLDOWN_SECONDS = 2 * 3600   # bir coin kapaninca bu sure tekrar girilmez
 DAILY_LOSS_LIMIT_PCT = 10.0   # gun basi bakiyeye gore bu kadar zarar olursa gun sonuna kadar yeni islem yok
@@ -113,7 +116,8 @@ WS_IDLE_RECONNECT = 30      # WS bagli ama bu kadar sn hic mesaj gelmezse yenide
 MAX_STREAMS = 300           # tek baglantida en fazla bu kadar coinin mum akisi istenir
 KLINE_KEEP = 150            # her coin icin bellekte tutulan mum sayisi
 SEED_LIMIT = 100            # acilista REST'ten cekilen gecmis mum sayisi
-SEED_SLEEP = 0.5            # gecmis mum cekerken coinler arasi bekleme (sn)
+SEED_SLEEP = 1.0            # gecmis mum cekerken coinler arasi bekleme (sn)
+SEED_PER_CYCLE = 40         # her tarama turunda en fazla bu kadar coinin gecmis mumu yuklenir (istek patlamasini onler)
 WS_STALE_SECONDS = 45       # WS'ten bu kadar sn veri gelmezse "calismiyor" sayilir
 KLINE_STALE_SECONDS = 600   # bir coinin mumu bu kadar sn guncellenmezse bayat sayilir
 TRAIL_TICK_SECONDS = 2      # WS aciksa gezen stop kontrol sikligi (REST istegi atmaz)
@@ -183,25 +187,57 @@ TF_MS = _tf_ms(TIMEFRAME)
 # ---------------- BAN / HIZ KORUMASI ----------------
 ban_until = 0.0
 ban_lock = threading.Lock()
+ban_strikes = 0            # ust uste kac kez limit yendi (ustel bekleme icin)
+last_ban_ts = 0.0
+BAN_FILE = "ban_state.json"
+
+
+def _save_ban():
+    """Ban suresini dosyaya yazar: bot yeniden baslarsa banli IP'ye hemen istek atip cezayi uzatmasin."""
+    try:
+        with open(BAN_FILE, "w") as f:
+            json.dump({"until": ban_until}, f)
+    except Exception:
+        pass
+
+
+def _load_ban():
+    global ban_until
+    try:
+        with open(BAN_FILE) as f:
+            ban_until = max(ban_until, float(json.load(f).get("until", 0)))
+        if ban_until > time.time():
+            log.warning(f"Onceki ban suruyor, {int(ban_until - time.time())} sn istek atilmayacak.")
+    except Exception:
+        pass
 
 
 def note_ban(err):
-    global ban_until
+    global ban_until, ban_strikes, last_ban_ts
     text = str(err)
+    now = time.time()
     wait_until = 0.0
     m = re.search(r"banned until (\d{10,})", text)
     if m:
         wait_until = int(m.group(1)) / 1000.0 + 15
     elif "418" in text or "-1003" in text or "429" in text or "Too many requests" in text:
-        wait_until = time.time() + 120
+        with ban_lock:
+            if now >= ban_until:                  # zaten beklemedeyken gelen gec hatalar sayilmaz
+                if now - last_ban_ts > 900:       # 15 dk sakin gectiyse sayac sifirlanir
+                    ban_strikes = 0
+                ban_strikes = min(ban_strikes + 1, 5)
+                last_ban_ts = now
+            n = max(ban_strikes, 1)
+        wait_until = now + min(120 * 2 ** (n - 1), 1800)    # 2, 4, 8, 16, 30 dk
     elif "restricted location" in text or "451" in text:
-        wait_until = time.time() + 600
+        wait_until = now + 600
     if wait_until:
         with ban_lock:
             if wait_until > ban_until:
                 ban_until = wait_until
                 left = int(ban_until - time.time())
                 log.error(f"⛔ Binance yasagi/limit algilandi, {left} sn istek atilmayacak.")
+                _save_ban()
         return True
     return False
 
@@ -738,7 +774,9 @@ def prepare_data(symbols, skip):
     need = [s for s in symbols if s not in skip and not is_fresh(to_raw(s))]
     if not need:
         return
-    log.info(f"Gecmis mum yukleniyor (REST, aralikli): {len(need)} coin")
+    total_need = len(need)
+    need = need[:SEED_PER_CYCLE]      # hacmi en yuksek coinler once, kalanlar sonraki turda (istek patlamasi olmasin)
+    log.info(f"Gecmis mum yukleniyor (REST, aralikli): {len(need)}/{total_need} coin")
     for s in need:
         wait_if_banned()
         try:
@@ -1117,6 +1155,7 @@ def scan_exit_orders(symbol, exit_side):
             orders = ex.fetch_open_orders(symbol, params=params)
         except Exception as e:
             log.warning(f"{symbol} acik emirler okunamadi {params}: {e}")
+            note_ban(e)
             continue
         for o in orders:
             if o.get("side") != exit_side:
@@ -1308,7 +1347,7 @@ def update_trailing_stop_logic(symbol, price):
             dist = min(mult * atr, st["ext"] * TRAIL_DIST_MARGIN_PCT / 100.0 / lev)
             raw_sl = st["ext"] - dist
             if profit_atr >= BREAKEVEN_AT_ATR:
-                raw_sl = max(raw_sl, entry)
+                raw_sl = max(raw_sl, entry * (1 + FEE_BUFFER_PCT / 100.0))
             new_sl = float(ex.price_to_precision(symbol, raw_sl))
             move_ok = new_sl > st["sl_price"] + 0.1 * atr and new_sl < price
         else:
@@ -1320,7 +1359,7 @@ def update_trailing_stop_logic(symbol, price):
             dist = min(mult * atr, st["ext"] * TRAIL_DIST_MARGIN_PCT / 100.0 / lev)
             raw_sl = st["ext"] + dist
             if profit_atr >= BREAKEVEN_AT_ATR:
-                raw_sl = min(raw_sl, entry)
+                raw_sl = min(raw_sl, entry * (1 - FEE_BUFFER_PCT / 100.0))
             new_sl = float(ex.price_to_precision(symbol, raw_sl))
             move_ok = new_sl < st["sl_price"] - 0.1 * atr and new_sl > price
 
@@ -1774,6 +1813,7 @@ def start_bot_once():
         if not _started:
             _started = True
             load_state()
+            _load_ban()
             threading.Thread(target=ws_thread, daemon=True).start()
             threading.Thread(target=bot_loop, daemon=True).start()
             threading.Thread(target=trail_loop, daemon=True).start()
