@@ -1,20 +1,24 @@
 """
 Binance USDT-M Futures botu (7/24) - WEBSOCKET VERI + REST SADECE ISLEM
-- Fiyat ve mum verisi WebSocket'ten gelir (REST'e istek atilmaz)
-- REST sadece: al/sat, stop koy, gezen stop guncelle, pozisyon senkronu (60 sn'de 1 istek)
-- Acilista her coinin gecmis mumlari REST'ten BIR KEZ cekilir (yavas, aralikli), sonrasi hep WebSocket
+- Fiyat ve mum verisi WebSocket'ten gelir
+- ON ELEME: tum coinlerin fiyat+hacmi !miniTicker@arr'dan (tek WS akisi) izlenir; son 15 dk'da en hizli
+  hareket eden + hacmi artan ilk PRESCREEN_TOP coin "aday" secilir. Detayli analiz (ADX, EMA, 1s teyidi) SADECE adaylara yapilir.
+- REST: al/sat, stop koy, gezen stop guncelle, pozisyon senkronu (60 sn'de 1 istek).
+  Tek istisna: yeni aday olan coinin gecmis mumlari REST'ten BIR KEZ cekilir (yavas, aralikli); sonrasi hep WebSocket.
+  1s teyidi artik REST'siz: 15dk mumlardan WS verisiyle uretilir.
+- Bot acilinca ~12 dk "isinma" yapar (fiyat gecmisi birikir), bu sure islem acmaz.
 - WebSocket calismazsa: kontrollu REST yedek modu (az coin, yavas, ban korumali)
-- 20M-800M hacim araligindaki TUM coinler taranir, 0-100 trend puani, LONG + SHORT
-- ATR stop-loss, kismi kar al (MARJINE gore %20), KADEMELI ATR gezen stop, stop sonrasi bekleme, gunluk zarar limiti
+- 20M-1,5 milyar hacim araligi, 0-100 trend puani, LONG + SHORT
+- ATR stop-loss, kismi kar al (MARJINE gore %20), DARALAN ATR gezen stop, stop sonrasi bekleme, gunluk zarar limiti
 - Render'da yeniden baslarsa acik pozisyonlari sahiplenir
 - KAR-AL (TP) GARANTISI: pozisyon basina TAM 1 kar-al emri. Koymadan once borsaya bakilir, koyduktan sonra
   sayilir, fazlasi iptal edilir. Ilk kar-al dolunca (pozisyon kuculunce) kalan tum kar-al emirleri silinir,
   boylece ikinci bir kar-al kalan yariyi kapatamaz.
 - ROTASYON: pozisyon limiti doluyken, uzun suredir kar/zarar ~0 civarinda sikismis ve kendi yonunde trendi
   kalmamis "bayat" pozisyon varsa, daha guclu bir trend bulununca bayat pozisyon kapatilip yeni coine girilir.
-- /scan adresi: son tarama adaylarini ve acik pozisyonlarin durumunu (kar %, yas, bayat mi) gosterir.
+- /scan adresi: hareketli coinleri, son tarama adaylarini ve acik pozisyonlarin durumunu gosterir.
 - BAN KORUMASI: 429/418 gelince ustel bekleme (2, 4, 8, 16, 30 dk), ban suresi dosyaya yazilir (yeniden baslatmada korunur),
-  acilistaki gecmis mum yuklemesi her turda en fazla SEED_PER_CYCLE coinle sinirlidir.
+  gecmis mum yuklemesi her turda en fazla SEED_PER_CYCLE coinle sinirlidir.
 
 Gerekli paketler (requirements.txt): ccxt, pandas, flask, gunicorn  (websocket icin EK PAKET GEREKMEZ)
 """
@@ -31,6 +35,7 @@ import ssl
 import base64
 import hashlib
 import struct
+from collections import deque
 from urllib.parse import urlparse, unquote
 
 import ccxt
@@ -53,10 +58,18 @@ TIMEFRAME = "15m"          # ana zaman dilimi
 HTF = "1h"                 # ust zaman dilimi (yon teyidi)
 LOOP_SECONDS = 180         # tarama araligi
 
-# --- Coin secimi (HEPSI taranir) ---
+# --- Coin secimi ---
 MIN_VOLUME = 20_000_000
-MAX_VOLUME = 800_000_000
+MAX_VOLUME = 1_500_000_000
 MAX_COIN_PRICE = 500.0
+
+# --- ON ELEME (hizli coin bulucu, sadece WebSocket verisi) ---
+PRESCREEN_WINDOW = 15 * 60       # fiyat/hacim degisimine bakilan pencere (sn)
+PRESCREEN_WARMUP = 12 * 60       # en az bu kadar fiyat gecmisi birikmeden on eleme calismaz (acilis isinmasi)
+PRESCREEN_TOP = 15               # her turda en hareketli kac coin detayli analize girsin
+PRESCREEN_MIN_MOVE_PCT = 0.3     # pencerede fiyat en az %0,3 oynamamissa aday olmaz
+HIST_SAMPLE_SECONDS = 10         # fiyat gecmisi ornekleme sikligi (sn)
+MAX_MOVE_1H = 0.15               # son 1 saatte %15'ten fazla oynamis coine girme (pump'a gec kalma)
 
 # --- Trend puani (0-100) ---
 MIN_TREND_SCORE = 50       # bunun altindaki coine girilmez (dusurursen daha cok islem acar)
@@ -76,19 +89,19 @@ LEV_NORMAL = 3             # puan < STRONG_SCORE
 LEV_STRONG = 5             # puan >= STRONG_SCORE
 MARGIN_PCT = 0.30          # bos bakiyenin %30'u marjin
 MAX_OPEN = 3
-SL_ATR = 1.5               # Stop-loss: giris -/+ 1.5 x ATR
-SL_MAX_MARGIN_PCT = 5.0    # ...ama stop marjinde en fazla bu kadar zarar ettirecek yerde olur (volatil coinde stop cok uzaga dusmesin)
+SL_ATR = 2.0               # Stop-loss: giris -/+ 2 x ATR (eskiden 1.5: normal dalgalanmada cok kolay tetikleniyordu)
+SL_MAX_MARGIN_PCT = 10.0   # ...ama stop marjinde en fazla bu kadar zarar ettirecek yerde olur (volatil coinde stop cok uzaga dusmesin)
 TP1_MARGIN_PCT = 20.0      # Ilk kar al: MARJINE gore %20 kar (fiyat hareketi = 20 / kaldirac %)
 TP1_CLOSE_PCT = 0.30       # ilk kar alda pozisyonun %50'si kapanir, kalan gezen stopla gider
 
-# --- Kademeli gezen stop (kar buyudukce daralir, ATR'ye baglidir) ---
-# Kar (ATR cinsinden) -> takip carpani. Kar sinirin altindaysa o carpan kullanilir.
-# Gezen stop islem acilir acilmaz fiyati izler: ilk kademede takip mesafesi SL ile ayni (1.5 ATR),
-# yani fiyat yukseldikce stop hemen arkasindan gelir (3x gibi gevsek bir bekleme yok).
-TRAIL_TIERS = ((2.0, SL_ATR),)           # kar < 2 ATR: 1.5x ATR takip
-TRAIL_TIGHT_ATR = 1.2      # kar 2 ATR'yi gecince en dar takip (1.2 x ATR)
-TRAIL_DIST_MARGIN_PCT = 3.0   # stop, fiyatin en fazla marjinde bu kadar gerisinde durur (fiyat hareketi = pct / kaldirac %). Pozisyon acildigi andan itibaren hep gecerli
-BREAKEVEN_AT_ATR = 1.0     # kar bu kadar ATR olunca stop en az girise cekilir (zarar etmeme)
+# --- DARALAN gezen stop (ATR'ye bagli) ---
+# Pozisyon acilinca sadece normal stop-loss (SL_ATR) vardir. Kar TRAIL_START_ATR'ye ulasinca gezen stop devreye girer.
+# Takip mesafesi kar buyudukce daralir: kar < TRAIL_TIERS limiti ise o carpan, limiti gecince TRAIL_TIGHT_ATR.
+TRAIL_START_ATR = 1.0      # kar bu kadar ATR olmadan gezen stop calismaz (yon belli olmadan atilmayi onler)
+TRAIL_TIERS = ((3.0, 1.5),)   # kar < 3 ATR: 1.5 x ATR geriden takip
+TRAIL_TIGHT_ATR = 1.0      # kar 3 ATR'yi gecince en dar takip (1 x ATR)
+TRAIL_MIN_DIST_PCT = 1.0   # takip mesafesi hicbir zaman fiyatin %1'inden az olmaz (gurultuye takilmamak icin)
+BREAKEVEN_AT_ATR = 1.5     # kar bu kadar ATR olunca stop en az girise cekilir (zarar etmeme)
 FEE_BUFFER_PCT = 0.12      # stop girise cekilirken eklenen komisyon payi (fiyatin %'si): giris+cikis komisyonu ~%0,1
 
 COOLDOWN_SECONDS = 2 * 3600   # bir coin kapaninca bu sure tekrar girilmez
@@ -113,17 +126,18 @@ ROTATE_MAX_PER_DAY = 6             # gunluk en fazla rotasyon (komisyon korumasi
 # Ikinci adres eski (legacy) adres, sadece yedek olarak denenir.
 WS_URLS = ["wss://fstream.binance.com/market/stream", "wss://fstream.binance.com/stream"]
 WS_IDLE_RECONNECT = 30      # WS bagli ama bu kadar sn hic mesaj gelmezse yeniden baglan
-MAX_STREAMS = 300           # tek baglantida en fazla bu kadar coinin mum akisi istenir
-KLINE_KEEP = 150            # her coin icin bellekte tutulan mum sayisi
-SEED_LIMIT = 100            # acilista REST'ten cekilen gecmis mum sayisi
+WS_RESUB_MIN_AGE = 30       # yeni aday coin akislari icin yeniden baglanmadan once baglantinin en az bu kadar sn yasi olmali
+MAX_STREAMS = 120           # ayni anda en fazla bu kadar coinin mum akisi tutulur (en eski hareketsizler cikarilir)
+KLINE_KEEP = 200            # her coin icin bellekte tutulan mum sayisi (1s teyidi icin 30+ saat gerekir)
+SEED_LIMIT = 200            # yeni aday icin REST'ten cekilen gecmis mum sayisi (agirlik 2)
 SEED_SLEEP = 1.0            # gecmis mum cekerken coinler arasi bekleme (sn)
-SEED_PER_CYCLE = 40         # her tarama turunda en fazla bu kadar coinin gecmis mumu yuklenir (istek patlamasini onler)
+SEED_PER_CYCLE = 20         # her tarama turunda en fazla bu kadar coinin gecmis mumu yuklenir (istek patlamasini onler)
 WS_STALE_SECONDS = 45       # WS'ten bu kadar sn veri gelmezse "calismiyor" sayilir
 KLINE_STALE_SECONDS = 600   # bir coinin mumu bu kadar sn guncellenmezse bayat sayilir
 TRAIL_TICK_SECONDS = 2      # WS aciksa gezen stop kontrol sikligi (REST istegi atmaz)
 TRAIL_CHECK_SECONDS = 20    # WS yoksa REST yedek kontrol sikligi
 POSITION_SYNC_SECONDS = 60  # pozisyon kapandi mi kontrolu (tek REST istegi)
-HTF_CACHE_SECONDS = 600     # 1s verisi bu sure onbellekte tutulur
+HTF_CACHE_SECONDS = 600     # (sadece REST yedek modu) 1s verisi bu sure onbellekte tutulur
 FALLBACK_MAX_COINS = 30     # WS yoksa REST yedek modunda taranacak en fazla coin
 FALLBACK_SLEEP = 0.5        # REST yedek modunda coinler arasi bekleme (sn)
 REST_TICKER_MIN_GAP = 120   # WS yoksa coin listesi REST'ten en az bu aralikla cekilir
@@ -520,6 +534,8 @@ class MiniWS:
 
 ws_lock = threading.Lock()
 tickers = {}          # "BTCUSDT" -> {"price": float, "vol": float(24s quote hacim)}
+tick_hist = {}        # "BTCUSDT" -> deque([(zaman, fiyat, 24s hacim), ...]) on eleme icin kisa fiyat gecmisi
+hot_ts = {}           # "BTCUSDT" -> en son "hareketli aday" olma zamani (eski akislari temizlemek icin)
 tickers_ts = 0.0      # son WS ticker mesaji zamani
 first_tick_ts = 0.0   # ilk WS ticker mesaji zamani
 klines = {}           # "BTCUSDT" -> [[t, o, h, l, c, v, kapandi_mi], ...]
@@ -528,10 +544,11 @@ dirty = set()         # mum boslugu olan (yeniden yuklenmesi gereken) coinler
 subscribed = set()    # mum akisi istenen coinler
 ws_connected = False
 rest_ticker_ts = 0.0
-last_scan = {"time": 0.0, "kaynak": "-", "adaylar": []}   # /scan adresi icin son tarama sonucu
+last_scan = {"time": 0.0, "kaynak": "-", "adaylar": [], "hareketli": []}   # /scan adresi icin son tarama sonucu
 COLS = ["timestamp", "open", "high", "low", "close", "volume", "closed"]
 STABLE_BASES = {"USDC", "BUSD", "FDUSD", "TUSD", "USDP", "DAI", "EUR", "AEUR", "EURI", "USD1", "XUSD"}
 START_TS = time.time()
+HIST_MAXLEN = int((PRESCREEN_WINDOW + 300) / HIST_SAMPLE_SECONDS) + 10
 
 
 def to_raw(symbol):
@@ -578,9 +595,17 @@ def ws_on_message(text):
         with ws_lock:
             for it in data:
                 try:
-                    tickers[it["s"]] = {"price": float(it["c"]), "vol": float(it["q"])}
+                    raw = it["s"]
+                    price = float(it["c"])
+                    vol = float(it["q"])
                 except (KeyError, ValueError, TypeError):
                     continue
+                tickers[raw] = {"price": price, "vol": vol}
+                h = tick_hist.get(raw)
+                if h is None:
+                    h = tick_hist[raw] = deque(maxlen=HIST_MAXLEN)
+                if not h or now - h[-1][0] >= HIST_SAMPLE_SECONDS:
+                    h.append((now, price, vol))
             tickers_ts = now
             if not first_tick_ts:
                 first_tick_ts = now
@@ -651,7 +676,7 @@ def ws_thread():
                     last_pong = now
                 with ws_lock:
                     missing = len(subscribed - conn_syms)
-                if missing and now - started > 15:
+                if missing and now - started > WS_RESUB_MIN_AGE:
                     log.info(f"WebSocket yeni coin akislari icin yeniden baglaniyor (+{missing} coin).")
                     break
                 if now - started > 23 * 3600:      # Binance baglantiyi 24 saatte keser
@@ -731,6 +756,57 @@ def get_dynamic_symbols():
     return symbols_from_cache()
 
 
+# ---------------- ON ELEME (hizli coin bulucu) ----------------
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def prescreen_movers(symbols):
+    """Sadece WS fiyat gecmisinden (REST YOK) son PRESCREEN_WINDOW sn'de en hizli hareket eden coinleri bulur.
+    Her coin icin: fiyat degisimi % ve hacim hizi (pencere hacmi / 24s ortalamanin ayni sureye dusen payi).
+    Isinma bitmediyse (yeterli gecmis yok) None doner; bitmis ama kimse esigi gecmediyse bos liste doner.
+    Not: 24s hacim 'kayan pencere' oldugu icin pencere hacmi hafif eksik hesaplanir; sadece siralama icindir."""
+    with ws_lock:
+        hist = {s: list(tick_hist.get(to_raw(s), ())) for s in symbols}
+    ready = 0
+    out = []
+    for s in symbols:
+        h = hist[s]
+        if len(h) < 2:
+            continue
+        t_now, p_now, v_now = h[-1]
+        target = t_now - PRESCREEN_WINDOW
+        ref = None
+        for smp in h:                           # en eskiden yeniye: pencerenin icindeki ilk ornek
+            if smp[0] >= target:
+                ref = smp
+                break
+        if ref is None:
+            continue
+        span = t_now - ref[0]
+        if span < PRESCREEN_WARMUP or ref[1] <= 0:
+            continue
+        ready += 1
+        chg = (p_now / ref[1] - 1.0) * 100.0
+        base = v_now * span / 86400.0
+        ratio = (v_now - ref[2]) / base if base > 0 else 0.0
+        if abs(chg) < PRESCREEN_MIN_MOVE_PCT:
+            continue
+        heat = abs(chg) * clamp(ratio, 0.5, 3.0)
+        out.append({"symbol": s, "chg": chg, "ratio": ratio, "heat": heat})
+    if ready == 0:
+        return None
+    out.sort(key=lambda m: m["heat"], reverse=True)
+    return out[:PRESCREEN_TOP]
+
+
+def mark_hot(symbols):
+    now = time.time()
+    with ws_lock:
+        for s in symbols:
+            hot_ts[to_raw(s)] = now
+
+
 # ---------------- Mum verisi ----------------
 def is_fresh(raw):
     with ws_lock:
@@ -740,13 +816,27 @@ def is_fresh(raw):
 
 
 def ensure_streams(symbols):
-    """Yeni coinlerin mum akislarini kaydeder; websocket kendini yeniden baglayarak bunlari ekler."""
+    """Yeni adaylarin mum akislarini kaydeder; websocket kendini yeniden baglayarak bunlari ekler.
+    Yer kalmazsa en eski hareketli olmus (ve acik pozisyonu olmayan) coinlerin akislari cikarilir."""
+    with trail_lock:
+        protect = {to_raw(s) for s in trail_state}
     with ws_lock:
         new = [to_raw(s) for s in symbols if to_raw(s) not in subscribed]
-        new = new[:max(0, MAX_STREAMS - len(subscribed))]
+        room = MAX_STREAMS - len(subscribed)
+        if len(new) > room:
+            need = len(new) - room
+            cands = sorted((r for r in subscribed if r not in protect and r not in new),
+                           key=lambda r: hot_ts.get(r, 0.0))
+            for r in cands[:need]:
+                subscribed.discard(r)
+                klines.pop(r, None)
+                kline_ts.pop(r, None)
+                dirty.discard(r)
+            room = MAX_STREAMS - len(subscribed)
+        new = new[:max(0, room)]
         subscribed.update(new)
     if new:
-        log.info(f"{len(new)} coin icin mum akisi isteniyor.")
+        log.info(f"{len(new)} aday coin icin mum akisi isteniyor.")
 
 
 def seed_symbol(symbol):
@@ -775,8 +865,8 @@ def prepare_data(symbols, skip):
     if not need:
         return
     total_need = len(need)
-    need = need[:SEED_PER_CYCLE]      # hacmi en yuksek coinler once, kalanlar sonraki turda (istek patlamasi olmasin)
-    log.info(f"Gecmis mum yukleniyor (REST, aralikli): {len(need)}/{total_need} coin")
+    need = need[:SEED_PER_CYCLE]      # en hareketli coinler once, kalanlar sonraki turda (istek patlamasi olmasin)
+    log.info(f"Gecmis mum yukleniyor (REST, bir kerelik, aralikli): {len(need)}/{total_need} coin")
     for s in need:
         wait_if_banned()
         try:
@@ -789,10 +879,6 @@ def prepare_data(symbols, skip):
 
 
 # ---------------- INDIKATORLER ----------------
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
-
-
 def calculate_indicators(df):
     df["ema_fast"] = df["close"].ewm(span=9, adjust=False).mean()
     df["ema_slow"] = df["close"].ewm(span=21, adjust=False).mean()
@@ -837,8 +923,39 @@ def get_df(symbol):
     return calculate_indicators(df.copy())
 
 
+def htf_df_from_ws(symbol):
+    """1 saatlik mumlari, WS/onbellekteki 15 dk mumlardan URETIR (REST istegi YOK).
+    Sadece tamamlanmis saatler kullanilir (her saatte TF'nin tum mumlari kapanmis olmali)."""
+    raw = to_raw(symbol)
+    with ws_lock:
+        rows = [r[:] for r in klines.get(raw, [])]
+    if len(rows) < 20:
+        return None
+    df = pd.DataFrame(rows, columns=COLS)
+    df = df[df["closed"]].copy()
+    if df.empty:
+        return None
+    per_hour = max(int(3_600_000 // TF_MS), 1)
+    df["hour"] = df["timestamp"] // 3_600_000
+    df = df[df.groupby("hour")["timestamp"].transform("count") >= per_hour]
+    if df.empty:
+        return None
+    g = df.groupby("hour")
+    h = pd.DataFrame({
+        "timestamp": g["timestamp"].first(),
+        "open": g["open"].first(),
+        "high": g["high"].max(),
+        "low": g["low"].min(),
+        "close": g["close"].last(),
+        "volume": g["volume"].sum(),
+    }).reset_index(drop=True)
+    if len(h) < 30:
+        return None
+    return calculate_indicators(h)
+
+
 def fetch_df_rest(symbol, timeframe, limit=100):
-    """REST ile mum (sadece yedek mod, 1s teyidi ve pozisyon sahiplenme icin)."""
+    """REST ile mum (sadece yedek mod ve pozisyon sahiplenme icin)."""
     ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df = df.iloc[:-1].copy()
@@ -880,6 +997,11 @@ def evaluate(df):
         return None, "rsi_asiri"
     if abs(close - es) / atr > MAX_EXT_ATR:
         return None, "gec_kalmis"
+    per_hour = max(int(3_600_000 // TF_MS), 1)
+    if len(df) > per_hour:
+        ref_close = float(df["close"].iloc[-1 - per_hour])
+        if ref_close > 0 and abs(close / ref_close - 1.0) > MAX_MOVE_1H:
+            return None, "pump_1s"          # son 1 saatte cok oynamis: pump/dump'a gec kalinmis olabilir
 
     vol_recent = float(df["volume"].iloc[-3:].mean())
     vol_base = float(df["volume"].iloc[-23:-3].mean())
@@ -906,18 +1028,22 @@ def evaluate(df):
     }, "ok"
 
 
-htf_cache = {}   # symbol -> (zaman, df)
+htf_cache = {}   # symbol -> (zaman, df)   (sadece REST yedek modu)
 
 
 def htf_alignment(symbol, side):
-    now = time.time()
-    cached = htf_cache.get(symbol)
-    if cached and now - cached[0] < HTF_CACHE_SECONDS:
-        df = cached[1]
-    else:
-        wait_if_banned()
-        df = fetch_df_rest(symbol, HTF)
-        htf_cache[symbol] = (now, df)
+    df = None
+    if ws_healthy() and is_fresh(to_raw(symbol)):
+        df = htf_df_from_ws(symbol)          # REST yok: 15 dk mumlardan uretilen 1s mumlar
+    if df is None:
+        now = time.time()
+        cached = htf_cache.get(symbol)
+        if cached and now - cached[0] < HTF_CACHE_SECONDS:
+            df = cached[1]
+        else:
+            wait_if_banned()
+            df = fetch_df_rest(symbol, HTF)
+            htf_cache[symbol] = (now, df)
     if len(df) < 30:
         return "belirsiz"
     last = df.iloc[-1]
@@ -943,8 +1069,23 @@ def scan_market(skip):
     if not symbols:
         return []
 
+    movers_view = []
     if ws_ok:
-        prepare_data(symbols, skip)
+        movers = prescreen_movers(symbols)
+        if movers is None:
+            log.info(f"⏳ Isinma: fiyat gecmisi birikiyor (en az {PRESCREEN_WARMUP // 60} dk). Bu sure islem acilmaz.")
+            last_scan = {"time": time.time(), "kaynak": "WebSocket (isinma)", "adaylar": [], "hareketli": []}
+            return []
+        hot = [m["symbol"] for m in movers if m["symbol"] not in skip]
+        movers_view = [{"coin": m["symbol"], "degisim_yuzde": round(m["chg"], 2),
+                        "hacim_x": round(m["ratio"], 1)} for m in movers]
+        if movers:
+            top = ", ".join(f"{m['symbol'].split('/')[0]} {m['chg']:+.1f}%" for m in movers[:8])
+            log.info(f"🔥 Hareketli coinler ({len(movers)}): {top}")
+        mark_hot(hot)
+        prepare_data(hot, skip)       # sadece bu adaylarin akisi acilir ve gecmis mumu (bir kez) yuklenir
+        hot_set = set(hot)
+        symbols = hot + [s for s in symbols if s not in hot_set and is_fresh(to_raw(s))]
     else:
         symbols = symbols[:FALLBACK_MAX_COINS]
         log.warning(f"⚠️ WebSocket hazir degil: REST yedek modu, sadece ilk {len(symbols)} coin, yavas taranacak.")
@@ -1000,13 +1141,15 @@ def scan_market(skip):
         final.append(cand)
 
     final.sort(key=lambda c: c["score"], reverse=True)
-    log.info(f"Elenenler: {reasons} | Trend adayi: {len(stage1)} | Ust trend teyidi gecen: {len(final)}")
+    log.info(f"Analiz edilen: {len(symbols)} | Elenenler: {reasons} | Trend adayi: {len(stage1)} | "
+             f"Ust trend teyidi gecen: {len(final)}")
     for c in final[:5]:
         log.info(f"  ⭐ {c['symbol']} {c['side'].upper()} puan={c['score']:.0f} adx={c['adx']:.0f} "
                  f"hacimx={c['rv']:.1f} rsi={c['rsi']:.0f} 1s={c['htf']}")
     last_scan = {
         "time": time.time(),
         "kaynak": "WebSocket" if ws_ok else "REST yedek",
+        "hareketli": movers_view,
         "adaylar": [{"coin": c["symbol"], "yon": c["side"], "puan": round(c["score"]),
                      "adx": round(c["adx"]), "hacim_x": round(c["rv"], 1), "rsi": round(c["rsi"]),
                      "ust_trend": c["htf"]} for c in final[:10]],
@@ -1078,8 +1221,8 @@ def enforce_single_tp(symbol, exit_side):
 
 
 def place_protection(symbol, entry, amount, atr, side="long", lev=1):
-    """SL: giris -/+ sl_distance (en fazla 1.5 ATR, marjinde en fazla %SL_MAX_MARGIN_PCT zarar).
-    TP1: marjine gore TP1_MARGIN_PCT kar (fiyat hareketi = pct / kaldirac), pozisyonun %50'si, TAM 1 emir."""
+    """SL: giris -/+ sl_distance (en fazla SL_ATR x ATR, marjinde en fazla %SL_MAX_MARGIN_PCT zarar).
+    TP1: marjine gore TP1_MARGIN_PCT kar (fiyat hareketi = pct / kaldirac), pozisyonun TP1_CLOSE_PCT'si, TAM 1 emir."""
     exit_side = "sell" if side == "long" else "buy"
     tp_move = (TP1_MARGIN_PCT / 100.0) / max(lev, 1)      # fiyatin yuzde kac oynamasi gerek
     sl_dist = sl_distance(entry, atr, lev)
@@ -1316,8 +1459,9 @@ def adopt_position(symbol, pos):
     return True
 
 
-# ---------------- GEZEN STOP (TRAILING) ----------------
+# ---------------- DARALAN GEZEN STOP (TRAILING) ----------------
 def trail_multiplier(profit_atr):
+    """Kar (ATR cinsinden) buyudukce takip mesafesi (ATR carpani) daralir."""
     for limit, mult in TRAIL_TIERS:
         if profit_atr < limit:
             return mult
@@ -1326,6 +1470,8 @@ def trail_multiplier(profit_atr):
 
 def update_trailing_stop_logic(symbol, price):
     """Anlik fiyatla gezen stopu hesaplar. REST'e SADECE stop gercekten tasinacaksa gider.
+    Kar TRAIL_START_ATR'ye ulasmadan stop yerinde kalir (sadece ilk stop-loss). Sonra takip mesafesi
+    kar buyudukce daralir (TRAIL_TIERS -> TRAIL_TIGHT_ATR) ve hicbir zaman fiyatin %TRAIL_MIN_DIST_PCT'inden az olmaz.
     Paylasilan state trail_lock altinda okunur/yazilir; REST cagrilari kilidin DISINDA yapilir."""
     with trail_lock:
         st = trail_state.get(symbol)
@@ -1337,14 +1483,15 @@ def update_trailing_stop_logic(symbol, price):
         entry = float(st["entry"])
         atr = st["atr"]
 
-        lev = float(st.get("lev") or LEV_NORMAL)
         if is_long:
             if price <= st["ext"]:
                 return
             st["ext"] = max(st["ext"], price)
             profit_atr = (st["ext"] - entry) / atr
+            if profit_atr < TRAIL_START_ATR:
+                return
             mult = trail_multiplier(profit_atr)
-            dist = min(mult * atr, st["ext"] * TRAIL_DIST_MARGIN_PCT / 100.0 / lev)
+            dist = max(mult * atr, st["ext"] * TRAIL_MIN_DIST_PCT / 100.0)
             raw_sl = st["ext"] - dist
             if profit_atr >= BREAKEVEN_AT_ATR:
                 raw_sl = max(raw_sl, entry * (1 + FEE_BUFFER_PCT / 100.0))
@@ -1355,8 +1502,10 @@ def update_trailing_stop_logic(symbol, price):
                 return
             st["ext"] = min(st["ext"], price)
             profit_atr = (entry - st["ext"]) / atr
+            if profit_atr < TRAIL_START_ATR:
+                return
             mult = trail_multiplier(profit_atr)
-            dist = min(mult * atr, st["ext"] * TRAIL_DIST_MARGIN_PCT / 100.0 / lev)
+            dist = max(mult * atr, st["ext"] * TRAIL_MIN_DIST_PCT / 100.0)
             raw_sl = st["ext"] + dist
             if profit_atr >= BREAKEVEN_AT_ATR:
                 raw_sl = min(raw_sl, entry * (1 - FEE_BUFFER_PCT / 100.0))
@@ -1387,7 +1536,7 @@ def update_trailing_stop_logic(symbol, price):
         new_order = ex.create_order(symbol, "STOP_MARKET", exit_side, amount_now, None,
                                     {"stopPrice": new_sl, "reduceOnly": True})
         cancel_safe(old_sl_id, symbol)
-        log.info(f"📈 {symbol} gezen stop: {old_sl_price} -> {new_sl} (kar {profit_atr:.1f} ATR)")
+        log.info(f"📈 {symbol} gezen stop: {old_sl_price} -> {new_sl} (kar {profit_atr:.1f} ATR, takip {mult} ATR)")
         with trail_lock:
             cur = trail_state.get(symbol)
             if cur is st:
@@ -1837,7 +1986,7 @@ def index():
 
 @app.route("/scan")
 def scan_view():
-    """Son tarama adaylari + acik pozisyonlarin durumu (kar %, yas, rotasyona aday mi)."""
+    """Hareketli coinler + son tarama adaylari + acik pozisyonlarin durumu (kar %, yas, rotasyona aday mi)."""
     now = time.time()
     with trail_lock:
         snap = {s: dict(st) for s, st in trail_state.items()}
@@ -1857,6 +2006,7 @@ def scan_view():
     return jsonify({
         "son_tarama_sn_once": round(now - last_scan["time"]) if last_scan["time"] else None,
         "tarama_kaynagi": last_scan["kaynak"],
+        "hareketli": last_scan.get("hareketli", []),
         "adaylar": last_scan["adaylar"],
         "pozisyonlar": pozisyonlar,
         "rotasyon_acik": ROTATE_ENABLED,
