@@ -1487,6 +1487,13 @@ def dedupe_stops(symbol):
                     place_tp_once(symbol, exit_side, expected, tpx)
 
     # ---------- STOP-LOSS EMIRLERI ----------
+    if not stops:
+        restore_missing_stop(symbol)         # borsada hic stop yok: yenisini koy (konamazsa kapat)
+        return
+    with trail_lock:
+        cs = trail_state.get(symbol)
+        if cs:
+            cs["nostop_n"] = 0
     if len(stops) <= 1:
         return
     keep_id, keep_price = (max if exit_side == "sell" else min)(stops, key=lambda x: x[1])
@@ -1689,6 +1696,88 @@ def sync_positions(symbols):
 
 
 # ---------------- YEDEK STOP (borsadaki stop calismazsa bot kendisi kapatir) ----------------
+def close_tracked_position(symbol, neden, journal_reason):
+    """Takip edilen pozisyonu market emriyle kapatir, emirleri siler, durumu temizler, gunluge yazar."""
+    with trail_lock:
+        st0 = trail_state.get(symbol)
+        if not st0:
+            return False
+        side = st0["side"]
+    wait_if_banned()
+    amount = None
+    try:
+        for p in ex.fetch_positions([symbol]):
+            if p.get("symbol") == symbol:
+                c = float(p.get("contracts") or 0)
+                if c > 0:
+                    amount = float(ex.amount_to_precision(symbol, c))
+                break
+    except Exception as e:
+        log.error(f"{symbol} {neden}: pozisyon miktari okunamadi: {e}")
+        note_ban(e)
+        return False
+    if not amount:
+        return False                # zaten kapanmis: sync_positions temizler
+    if not emergency_close(symbol, side, amount, neden=neden):
+        return False
+    cancel_all_safe(symbol)
+    with trail_lock:
+        closed_st = trail_state.pop(symbol, None)
+        cooldown[symbol] = time.time() + COOLDOWN_SECONDS
+        save_state()
+    journal_close(symbol, closed_st, journal_reason)
+    return True
+
+
+def restore_missing_stop(symbol):
+    """Borsada hic stop-loss yoksa (iptal olmus, hic konmamis vb.) yenisini koyar; konamazsa pozisyonu kapatir.
+    dedupe_stops icinden dakikada bir cagrilir. Emir listesi okunamadiysa yanlis alarm olmasin diye
+    ust uste 2 kontrolde stop gorunmezse harekete gecer."""
+    with trail_lock:
+        st = trail_state.get(symbol)
+        if not st:
+            return
+        st["nostop_n"] = st.get("nostop_n", 0) + 1
+        n = st["nostop_n"]
+        side, entry, atr = st["side"], float(st["entry"]), float(st["atr"])
+        lev = float(st.get("lev") or LEV_NORMAL)
+        amount = float(st.get("amount") or 0)
+    if n < 2:
+        return
+    exit_side = "sell" if side == "long" else "buy"
+    try:
+        price = float(ex.fetch_ticker(symbol)["last"])
+        d = sl_distance(entry, atr, lev)
+        # Stop girisin degil, mevcut fiyatin dogru tarafinda olmali (fiyat stopu coktan gectiyse hemen kapat)
+        sl_raw = entry - d if side == "long" else entry + d
+        already_past = price <= sl_raw if side == "long" else price >= sl_raw
+        if already_past:
+            log.warning(f"🆘 {symbol}: stop yoktu ve fiyat stop seviyesini gecmis, pozisyon kapatiliyor.")
+            close_tracked_position(symbol, "stop yok + fiyat gecmis", "stop yoktu, fiyat stopu gecmisti")
+            return
+        sl_price = float(ex.price_to_precision(symbol, sl_raw))
+        pos_amt = amount
+        for p in ex.fetch_positions([symbol]):
+            if p.get("symbol") == symbol and float(p.get("contracts") or 0) > 0:
+                pos_amt = float(ex.amount_to_precision(symbol, float(p["contracts"])))
+                break
+        order = ex.create_order(symbol, "STOP_MARKET", exit_side, pos_amt, None,
+                                {"stopPrice": sl_price, "reduceOnly": True})
+        with trail_lock:
+            cur = trail_state.get(symbol)
+            if cur:
+                cur["sl_id"] = order.get("id")
+                cur["sl_price"] = sl_price
+                cur["nostop_n"] = 0
+                save_state()
+        log.warning(f"🛟 {symbol}: borsada stop yoktu, yeni SL kondu @ {sl_price}")
+    except Exception as e:
+        log.error(f"{symbol} eksik stop yenilenemedi: {e}")
+        note_ban(e)
+        log.warning(f"🆘 {symbol}: stop konamadi, pozisyon kapatiliyor.")
+        close_tracked_position(symbol, "stop konamadi", "stop yoktu ve konamadi")
+
+
 def backup_stop_check(symbol, price):
     """Borsadaki stop calismadiysa / cok kaydiysa: fiyat stopu BACKUP_STOP_GAP_PCT kadar gectiginde
     pozisyonu bot kendisi market emriyle kapatir. Kontrol WS fiyatiyla yapilir (REST'e SADECE tetiklenince gider)."""
@@ -1707,29 +1796,7 @@ def backup_stop_check(symbol, price):
     with trail_lock:
         st["backup_ts"] = time.time()
     log.warning(f"🛟 {symbol} fiyat stopu gecti ({price} / SL {sl}), yedek stop kapatiyor.")
-    wait_if_banned()
-    amount = None
-    try:
-        for p in ex.fetch_positions([symbol]):
-            if p.get("symbol") == symbol:
-                c = float(p.get("contracts") or 0)
-                if c > 0:
-                    amount = float(ex.amount_to_precision(symbol, c))
-                break
-    except Exception as e:
-        log.error(f"{symbol} yedek stop: pozisyon miktari okunamadi: {e}")
-        note_ban(e)
-        return
-    if not amount:
-        return                      # zaten kapanmis: sync_positions temizler
-    if not emergency_close(symbol, side, amount, neden="yedek stop"):
-        return
-    cancel_all_safe(symbol)
-    with trail_lock:
-        closed_st = trail_state.pop(symbol, None)
-        cooldown[symbol] = time.time() + COOLDOWN_SECONDS
-        save_state()
-    journal_close(symbol, closed_st, "yedek stop (borsa stopu calismadi)")
+    close_tracked_position(symbol, "yedek stop", "yedek stop (borsa stopu calismadi)")
 
 
 def trail_loop():
