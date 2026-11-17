@@ -20,6 +20,8 @@ Binance USDT-M Futures botu (7/24) - WEBSOCKET VERI + REST SADECE ISLEM
 - KAR-AL (TP) GARANTISI: pozisyon basina TAM 1 kar-al emri. Koymadan once borsaya bakilir, koyduktan sonra
   sayilir, fazlasi iptal edilir. Ilk kar-al dolunca (pozisyon kuculunce) kalan tum kar-al emirleri silinir,
   boylece ikinci bir kar-al kalan yariyi kapatamaz.
+- YEDEK STOP: borsadaki stop calismaz/kayarsa, fiyat stopu BACKUP_STOP_GAP_PCT kadar gectiginde bot pozisyonu
+  kendisi market emriyle kapatir (WS fiyatiyle, 2 sn'de bir kontrol).
 - ROTASYON: pozisyon limiti doluyken, uzun suredir kar/zarar ~0 civarinda sikismis ve kendi yonunde trendi
   kalmamis "bayat" pozisyon varsa, daha guclu bir trend bulununca bayat pozisyon kapatilip yeni coine girilir.
 - /scan adresi: hareketli coinleri, son tarama adaylarini ve acik pozisyonlarin durumunu gosterir.
@@ -117,6 +119,7 @@ FEE_BUFFER_PCT = 0.12      # stop girise cekilirken eklenen komisyon payi (fiyat
 
 COOLDOWN_SECONDS = 2 * 3600   # bir coin kapaninca bu sure tekrar girilmez
 DAILY_LOSS_LIMIT_PCT = 5.0    # gun basi bakiyeye gore bu kadar zarar olursa gun sonuna kadar yeni islem yok
+BACKUP_STOP_GAP_PCT = 0.5     # fiyat stopu bu kadar (%) gecip pozisyon hala aciksa bot kendisi kapatir
 ALLOW_LONG = True
 ALLOW_SHORT = True
 STATE_FILE = "bot_state.json"
@@ -1685,6 +1688,50 @@ def sync_positions(symbols):
             journal_close(symbol, closed_st, "borsada kapandi (stop / kar-al / gezen stop)")
 
 
+# ---------------- YEDEK STOP (borsadaki stop calismazsa bot kendisi kapatir) ----------------
+def backup_stop_check(symbol, price):
+    """Borsadaki stop calismadiysa / cok kaydiysa: fiyat stopu BACKUP_STOP_GAP_PCT kadar gectiginde
+    pozisyonu bot kendisi market emriyle kapatir. Kontrol WS fiyatiyla yapilir (REST'e SADECE tetiklenince gider)."""
+    with trail_lock:
+        st = trail_state.get(symbol)
+        if not st:
+            return
+        side = st["side"]
+        sl = float(st["sl_price"])
+        if time.time() - st.get("backup_ts", 0) < 20:       # ust uste tekrar denemesin
+            return
+    gap = BACKUP_STOP_GAP_PCT / 100.0
+    breach = price <= sl * (1 - gap) if side == "long" else price >= sl * (1 + gap)
+    if not breach:
+        return
+    with trail_lock:
+        st["backup_ts"] = time.time()
+    log.warning(f"🛟 {symbol} fiyat stopu gecti ({price} / SL {sl}), yedek stop kapatiyor.")
+    wait_if_banned()
+    amount = None
+    try:
+        for p in ex.fetch_positions([symbol]):
+            if p.get("symbol") == symbol:
+                c = float(p.get("contracts") or 0)
+                if c > 0:
+                    amount = float(ex.amount_to_precision(symbol, c))
+                break
+    except Exception as e:
+        log.error(f"{symbol} yedek stop: pozisyon miktari okunamadi: {e}")
+        note_ban(e)
+        return
+    if not amount:
+        return                      # zaten kapanmis: sync_positions temizler
+    if not emergency_close(symbol, side, amount, neden="yedek stop"):
+        return
+    cancel_all_safe(symbol)
+    with trail_lock:
+        closed_st = trail_state.pop(symbol, None)
+        cooldown[symbol] = time.time() + COOLDOWN_SECONDS
+        save_state()
+    journal_close(symbol, closed_st, "yedek stop (borsa stopu calismadi)")
+
+
 def trail_loop():
     log.info("Gezen stop dongusu basladi (WS fiyati, REST sadece stop tasirken).")
 
@@ -1729,6 +1776,7 @@ def trail_loop():
 
                 for symbol, price in prices.items():
                     try:
+                        backup_stop_check(symbol, price)
                         update_trailing_stop_logic(symbol, price)
                     except Exception as e:
                         log.error(f"{symbol} gezen stop hatasi: {e}")
