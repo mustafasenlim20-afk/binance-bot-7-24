@@ -76,7 +76,7 @@ MAX_COIN_PRICE = 500.0
 # --- ON ELEME (hizli coin bulucu, sadece WebSocket verisi) ---
 PRESCREEN_WINDOW = 15 * 60       # fiyat/hacim degisimine bakilan pencere (sn)
 PRESCREEN_WARMUP = 12 * 60       # en az bu kadar fiyat gecmisi birikmeden on eleme calismaz (acilis isinmasi)
-PRESCREEN_TOP = 15               # her turda en hareketli kac coin detayli analize girsin
+PRESCREEN_TOP = 40               # her turda en hareketli kac coin detayli analize girsin
 PRESCREEN_MIN_MOVE_PCT = 0.3     # pencerede fiyat en az %0,3 oynamamissa aday olmaz
 HIST_SAMPLE_SECONDS = 10         # fiyat gecmisi ornekleme sikligi (sn)
 MAX_MOVE_1H = 0.15               # son 1 saatte %15'ten fazla oynamis coine girme (pump'a gec kalma)
