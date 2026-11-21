@@ -2,15 +2,16 @@
 Binance USDT-M Futures botu (7/24) - WEBSOCKET VERI + REST SADECE ISLEM
 - Fiyat ve mum verisi WebSocket'ten gelir
 - ON ELEME: tum coinlerin fiyat+hacmi !miniTicker@arr'dan (tek WS akisi) izlenir; son 15 dk'da en hizli
-  hareket eden + hacmi artan ilk PRESCREEN_TOP coin "aday" secilir. Detayli analiz (ADX, EMA, 1s teyidi) SADECE adaylara yapilir.
+  hareket eden + hacmi artan ilk PRESCREEN_TOP coin "aday" secilir. Detayli analiz (ADX, EMA, MACD, 1s teyidi) SADECE adaylara yapilir.
 - REST: al/sat, stop koy, gezen stop guncelle, pozisyon senkronu (60 sn'de 1 istek).
   Tek istisna: yeni aday olan coinin gecmis mumlari REST'ten BIR KEZ cekilir (yavas, aralikli); sonrasi hep WebSocket.
   1s teyidi artik REST'siz: 15dk mumlardan WS verisiyle uretilir.
 - Bot acilinca ~12 dk "isinma" yapar (fiyat gecmisi birikir), bu sure islem acmaz.
 - WebSocket calismazsa: kontrollu REST yedek modu (az coin, yavas, ban korumali)
 - 20M-1,5 milyar hacim araligi, 0-100 trend puani, LONG + SHORT
+- MACD HISTOGRAM TEYIDI: sinyal yonunde ve zayiflamayan momentum yoksa girilmez (yanlis sinyali azaltir, kesinlik GARANTI ETMEZ)
 - ATR stop-loss (marjinde en fazla %20 zarar), kismi kar al (MARJINE gore %25, pozisyonun %70'i), DARALAN ATR gezen stop,
-  stop sonrasi bekleme, gunluk zarar limiti (%5)
+  stop sonrasi bekleme, gunluk zarar limiti (%8)
 - TEK POZISYON (MAX_OPEN=1), 15x kaldirac (coin desteklemezse sirayla 10/8/5/3x denenir)
 - RISK BAZLI POZISYON BOYUTU: her islemde stop olursa hesabin en fazla RISK_PCT'si gider
 - BTC FILTRESI: BTC son 15 dk'da sert dusuyorsa long, sert cikiyorsa short acilmaz
@@ -85,13 +86,22 @@ MIN_TREND_SCORE = 50       # bunun altindaki coine girilmez (dusurursen daha cok
 STRONG_SCORE = 70          # bu puan ve ustu = guclu trend
 HTF_CHECK_TOP = 10         # ust zaman dilimi teyidi en iyi kac coine yapilsin
 HTF_PTS = 15               # ust zaman dilimi uyumlu ise puan (belirsizse yarisi, ters ise elenir)
-ADX_MIN = 20               # bunun altinda trend yok sayilir
+ADX_MIN = 25               # bunun altinda trend yok sayilir (eskiden 20: yatay piyasada yanlis sinyal veriyordu)
 MIN_ATR_PCT = 0.005        # ATR / fiyat en az %0,5 (cok durgun coinde komisyon yer)
 MIN_REL_VOL = 0.7          # son 3 mum hacmi / onceki 20 mum ortalamasi en az bu olsun
 RSI_MAX_LONG = 75          # long'da RSI bunun ustundeyse trend yorulmus
 RSI_MIN_SHORT = 25         # short'ta RSI bunun altindaysa trend yorulmus
 MAX_EXT_ATR = 4.0          # fiyat EMA21'den 4 ATR'den fazla uzaksa gec kalinmis, girme
 BREAKOUT_BARS = 12         # kirilim icin bakilan onceki mum sayisi
+
+# --- MACD HISTOGRAM TEYIDI (yeni) ---
+# Long icin histogram > 0 ve bir onceki mumdan kucuk olmamali, short icin tersi.
+# Amac: EMA/ADX yonu dogru olsa bile momentumu sonmus (yavaslayan) hareketlere girmemek.
+# Kesin sonuc vermez, sadece yanlis giris ihtimalini azaltir. Kapatmak icin False yap.
+MACD_FILTER_ENABLED = True
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
 
 # --- Islem ---
 LEV_NORMAL = 15            # puan < STRONG_SCORE
@@ -118,7 +128,8 @@ BREAKEVEN_AT_ATR = 1.5     # kar bu kadar ATR olunca stop en az girise cekilir (
 FEE_BUFFER_PCT = 0.12      # stop girise cekilirken eklenen komisyon payi (fiyatin %'si): giris+cikis komisyonu ~%0,1
 
 COOLDOWN_SECONDS = 2 * 3600   # bir coin kapaninca bu sure tekrar girilmez
-DAILY_LOSS_LIMIT_PCT = 5.0    # gun basi bakiyeye gore bu kadar zarar olursa gun sonuna kadar yeni islem yok
+DAILY_LOSS_LIMIT_PCT = 8.0    # gun basi bakiyeye gore bu kadar zarar olursa gun sonuna kadar yeni islem yok (eskiden 5)
+LOSS_LOG_EVERY = 3600         # "limit doldu" uyarisi en fazla bu kadar sn'de bir loga yazilir (log kirliligini onler)
 BACKUP_STOP_GAP_PCT = 0.5     # fiyat stopu bu kadar (%) gecip pozisyon hala aciksa bot kendisi kapatir
 ALLOW_LONG = True
 ALLOW_SHORT = True
@@ -978,6 +989,12 @@ def calculate_indicators(df):
     df["ema_fast"] = df["close"].ewm(span=9, adjust=False).mean()
     df["ema_slow"] = df["close"].ewm(span=21, adjust=False).mean()
 
+    # MACD histogram (yeni): momentumun hizlanip yavaslamadigini gosterir
+    macd_line = (df["close"].ewm(span=MACD_FAST, adjust=False).mean()
+                 - df["close"].ewm(span=MACD_SLOW, adjust=False).mean())
+    macd_sig = macd_line.ewm(span=MACD_SIGNAL, adjust=False).mean()
+    df["macd_hist"] = macd_line - macd_sig
+
     delta = df["close"].diff()
     gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
@@ -1062,8 +1079,8 @@ def evaluate(df):
     if len(df) < 60:
         return None, "veri_az"
     last = df.iloc[-1]
-    needed = ["adx", "rsi", "atr", "plus_di", "minus_di", "ema_fast", "ema_slow"]
-    if any(pd.isna(last[k]) for k in needed) or pd.isna(df["adx"].iloc[-4]):
+    needed = ["adx", "rsi", "atr", "plus_di", "minus_di", "ema_fast", "ema_slow", "macd_hist"]
+    if any(pd.isna(last[k]) for k in needed) or pd.isna(df["adx"].iloc[-4]) or pd.isna(df["macd_hist"].iloc[-2]):
         return None, "veri_eksik"
 
     close = float(last["close"])
@@ -1092,6 +1109,16 @@ def evaluate(df):
         return None, "rsi_asiri"
     if abs(close - es) / atr > MAX_EXT_ATR:
         return None, "gec_kalmis"
+
+    # MACD teyidi: momentum sinyal yonunde ve zayiflamiyor olmali
+    if MACD_FILTER_ENABLED:
+        mh = float(last["macd_hist"])
+        mh_prev = float(df["macd_hist"].iloc[-2])
+        if side == "long" and not (mh > 0 and mh >= mh_prev):
+            return None, "macd_zayif"
+        if side == "short" and not (mh < 0 and mh <= mh_prev):
+            return None, "macd_zayif"
+
     per_hour = max(int(3_600_000 // TF_MS), 1)
     if len(df) > per_hour:
         ref_close = float(df["close"].iloc[-1 - per_hour])
@@ -1866,7 +1893,11 @@ def get_open_symbols():
     return [p["symbol"] for p in positions if float(p.get("contracts") or 0) > 0]
 
 
+last_loss_log = 0.0
+
+
 def daily_loss_hit():
+    global last_loss_log
     try:
         total = float(ex.fetch_balance()["USDT"]["total"])
     except Exception as e:
@@ -1882,7 +1913,10 @@ def daily_loss_hit():
         start = float(day_state["start"])
     loss_pct = (start - total) / start * 100 if start > 0 else 0.0
     if loss_pct >= DAILY_LOSS_LIMIT_PCT:
-        log.warning(f"🚫 Gunluk zarar limiti doldu (%{loss_pct:.1f}). Gun sonuna kadar yeni islem yok.")
+        # Uyari her turda degil, en fazla LOSS_LOG_EVERY sn'de bir yazilir (log kirliligini onler)
+        if time.time() - last_loss_log > LOSS_LOG_EVERY:
+            log.warning(f"🚫 Gunluk zarar limiti doldu (%{loss_pct:.1f}). Gun sonuna kadar yeni islem yok.")
+            last_loss_log = time.time()
         return True
     return False
 
