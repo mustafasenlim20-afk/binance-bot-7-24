@@ -113,7 +113,7 @@ MAX_OPEN = 1               # ayni anda tek pozisyon
 SL_ATR = 2.0               # Stop-loss: giris -/+ 2 x ATR
 SL_MAX_MARGIN_PCT = 20.0   # ...ama stop marjinde en fazla bu kadar zarar ettirecek yerde olur (volatil coinde stop cok uzaga dusmesin)
 TP1_MARGIN_PCT = 25.0      # Ilk kar al: MARJINE gore %25 kar (fiyat hareketi = 25 / kaldirac %)
-TP1_CLOSE_PCT = 0.70       # ilk kar alda pozisyonun %70'i kapanir (marjinde +%17,5 kar), kalan %30 gezen stopla gider
+TP1_CLOSE_PCT = 0.50       # ilk kar alda pozisyonun %70'i kapanir (marjinde +%17,5 kar), kalan %30 gezen stopla gider
 
 # --- DARALAN gezen stop (ATR'ye bagli) ---
 # Pozisyon acilinca sadece normal stop-loss (SL_ATR) vardir. Kar TRAIL_START_ATR'ye ulasinca gezen stop devreye girer.
