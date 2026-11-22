@@ -418,6 +418,7 @@ def journal_close(symbol, st, reason):
 
 # =====================================================================
 #     WEBSOCKET VERI KATMANI  (hicbir paket gerektirmez: sadece Python'un kendi kutuphaneleri)
+# =====================================================================#     WEBSOCKET VERI KATMANI  (hicbir paket gerektirmez: sadece Python'un kendi kutuphaneleri)
 # =====================================================================
 class MiniWS:
     """Kucuk RFC 6455 websocket istemcisi (ws:// ve wss://). Sunucuya paket kurmaya gerek birakmaz."""
@@ -868,8 +869,7 @@ def get_dynamic_symbols():
     return symbols_from_cache()
 
 
-# ---------------- ON ELEME (hizli coin bulucu) ----------------
-def clamp(x, lo, hi):
+# ---------------- ON ELEME (hizli coin bulucu) ----------------def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
 
@@ -1432,8 +1432,7 @@ def scan_market(skip):
         stage1.append(cand)
 
     stage1.sort(key=lambda c: c["score"], reverse=True)
-    final = []
-    for cand in stage1[:HTF_CHECK_TOP]:
+    final = []for cand in stage1[:HTF_CHECK_TOP]:
         try:
             htf = htf_alignment(cand["symbol"], cand["side"])
         except Exception as e:
@@ -2169,6 +2168,15 @@ def open_trade(cand, open_symbols):
         # (aksi halde bot 15x varsayip stopu yanlis hesaplardi).
         lev_ok = None
         for try_lev in (lev,) + LEV_FALLBACKS:
+            try:ex.set_margin_mode("isolated", symbol)
+        except Exception:
+            pass
+
+        # Kaldirac: once hedef (15x), coin desteklemezse sirayla daha dusuk degerler denenir.
+        # Gercekten ayarlanan kaldirac kullanilir; hic biri ayarlanamazsa islem acilmaz
+        # (aksi halde bot 15x varsayip stopu yanlis hesaplardi).
+        lev_ok = None
+        for try_lev in (lev,) + LEV_FALLBACKS:
             try:
                 ex.set_leverage(try_lev, symbol)
                 lev_ok = try_lev
@@ -2329,3 +2337,233 @@ def close_position_for_rotation(symbol):
                 if c > 0:
                     amount = float(ex.amount_to_precision(symbol, c))
                 break
+    except Exception as e:
+        log.error(f"{symbol} rotasyon: pozisyon miktari okunamadi: {e}")
+        note_ban(e)
+        return False
+    if not amount:
+        return False                      # zaten kapanmis: sync_positions temizler
+    if not emergency_close(symbol, side, amount, neden="rotasyon"):
+        return False
+    cancel_all_safe(symbol)
+    with trail_lock:
+        closed_st = trail_state.pop(symbol, None)
+        cooldown[symbol] = time.time() + COOLDOWN_SECONDS
+        save_state()
+    journal_close(symbol, closed_st, "rotasyon (bayat pozisyon)")
+    return True
+
+
+def rotate_if_needed(open_symbols):
+    """Pozisyon limiti doluyken calisir. Bayat pozisyon varsa ve guclu (>= ROTATE_MIN_SCORE) bir trend bulunursa
+    bayati kapatip yeni coine girer. Rotasyon yapildiysa True doner."""
+    if not ROTATE_ENABLED or not TRADING_ENABLED:
+        return False
+    now = time.time()
+    with rotate_lock:
+        rotate_times[:] = [t for t in rotate_times if now - t < 86400]
+        if rotate_times and now - rotate_times[-1] < ROTATE_GAP_SECONDS:
+            return False
+        if len(rotate_times) >= ROTATE_MAX_PER_DAY:
+            return False
+
+    stale = find_stale_positions()
+    if not stale:
+        return False
+    names = ", ".join(f"{s.split('/')[0]} (%{p:+.1f}, {a:.0f} dk, puan {o:.0f})" for s, p, a, o in stale)
+    log.info(f"💤 Bayat pozisyon(lar): {names}. Daha guclu trend araniyor...")
+
+    if daily_loss_hit():
+        return False
+
+    with trail_lock:
+        skip = set(open_symbols) | set(cooldown.keys())
+    candidates = scan_market(skip)
+    strong = [c for c in candidates if c["score"] >= ROTATE_MIN_SCORE]
+    if not strong:
+        log.info(f"Rotasyon icin yeterince guclu trend yok (esik {ROTATE_MIN_SCORE}), bayat pozisyon korunuyor.")
+        return False
+
+    cand = strong[0]
+    symbol, pnl, age_min, own = stale[0]
+    log.info(f"🔄 ROTASYON: {symbol} (%{pnl:+.1f}, {age_min:.0f} dk, puan {own:.0f}) kapatilip "
+             f"{cand['symbol']} {cand['side'].upper()} (puan {cand['score']:.0f}) acilacak.")
+    if not close_position_for_rotation(symbol):
+        log.warning(f"{symbol} rotasyon icin kapatilamadi, yeni islem acilmadi.")
+        return False
+    if symbol in open_symbols:
+        open_symbols.remove(symbol)
+    with rotate_lock:
+        rotate_times.append(time.time())
+    try:
+        open_trade(cand, open_symbols)
+    except Exception as e:
+        log.error(f"{cand['symbol']} rotasyon sonrasi islem acma hatasi: {e}")
+        note_ban(e)
+    return True
+
+
+def bot_loop():
+    log.info("Bot arkaplan dongusu basladi.")
+    if not TRADING_ENABLED:
+        log.warning("📝 KAGIT MODU: TRADING_ENABLED=0, bot emir vermeyecek, sadece sinyalleri loglayacak.")
+    while True:
+        wait_if_banned()
+        try:
+            try:
+                open_symbols = get_open_symbols()
+            except Exception as e:
+                log.error(f"Pozisyonlar cekilemedi: {e}")
+                note_ban(e)
+                time.sleep(30)
+                continue
+
+            if len(open_symbols) >= MAX_OPEN:
+                log.info(f"Pozisyon limiti dolu ({len(open_symbols)}/{MAX_OPEN}), yeni tarama yapilmadi.")
+                try:
+                    rotate_if_needed(open_symbols)
+                except Exception as e:
+                    log.error(f"Rotasyon hatasi: {e}")
+                    note_ban(e)
+                time.sleep(LOOP_SECONDS)
+                continue
+
+            if daily_loss_hit():
+                time.sleep(LOOP_SECONDS)
+                continue
+
+            now = time.time()
+            with trail_lock:
+                for s in [s for s, t in cooldown.items() if t <= now]:
+                    cooldown.pop(s, None)
+                skip = set(open_symbols) | set(cooldown.keys())
+
+            candidates = scan_market(skip)
+            if not candidates:
+                log.info("Bu turda esigi gecen trend yok, islem acilmadi.")
+
+            for cand in candidates:
+                if len(open_symbols) >= MAX_OPEN:
+                    break
+                if cand["symbol"] in open_symbols:
+                    continue
+                try:
+                    open_trade(cand, open_symbols)
+                    time.sleep(2)
+                except Exception as inner_err:
+                    log.error(f"{cand['symbol']} islem hatasi: {inner_err}")
+                    if "-4411" in str(inner_err):
+                        # TradFi-Perps sozlesmesi imzalanmamis (hisse/emtia vadelisi): 24 saat atla
+                        with trail_lock:
+                            cooldown[cand["symbol"]] = time.time() + 24 * 3600
+                            save_state()
+                        log.warning(f"🚫 {cand['symbol']} TradFi-Perps sozlesmesi gerektiriyor, 24 saat atlanacak.")
+                        continue
+                    if note_ban(inner_err):
+                        break
+
+        except Exception as e:
+            log.error(f"Dongu hatasi: {e}")
+            note_ban(e)
+
+        time.sleep(LOOP_SECONDS)
+
+
+_started = False
+_start_lock = threading.Lock()
+
+
+def start_bot_once():
+    global _started
+    with _start_lock:
+        if not _started:
+            _started = True
+            load_state()
+            _load_ban()
+            threading.Thread(target=ws_thread, daemon=True).start()
+            threading.Thread(target=bot_loop, daemon=True).start()
+            threading.Thread(target=trail_loop, daemon=True).start()
+
+
+start_bot_once()
+
+
+@app.route("/")
+def index():
+    return jsonify({
+        "status": "running",
+        "emir_veriyor": TRADING_ENABLED,
+        "websocket": ws_healthy(),
+        "websocket_bagli": ws_connected,
+        "fiyat_yasi_sn": round(time.time() - tickers_ts, 1) if tickers_ts else None,
+        "izlenen_coin": len(subscribed),
+        "takip_edilen": list(trail_state.keys()),
+        "bekleyen_coin": len(cooldown),
+    })
+
+
+@app.route("/scan")
+def scan_view():
+    """Hareketli coinler + son tarama adaylari + acik pozisyonlarin durumu (kar %, yas, rotasyona aday mi)."""
+    now = time.time()
+    with trail_lock:
+        snap = {s: dict(st) for s, st in trail_state.items()}
+    stale_names = {s for s, _, _, _ in find_stale_positions()}
+    pozisyonlar = []
+    for s, st in snap.items():
+        with ws_lock:
+            t = tickers.get(to_raw(s))
+        pnl = position_pnl_margin_pct(st, t["price"]) if t else None
+        pozisyonlar.append({
+            "coin": s,
+            "yon": st.get("side"),
+            "kar_marjin_yuzde": round(pnl, 2) if pnl is not None else None,
+            "yas_dk": round((now - float(st.get("opened_at") or now)) / 60),
+            "bayat": s in stale_names,
+        })
+    btc = btc_change_pct()
+    return jsonify({
+        "son_tarama_sn_once": round(now - last_scan["time"]) if last_scan["time"] else None,
+        "tarama_kaynagi": last_scan["kaynak"],
+        "btc_son_15dk_yuzde": round(btc, 2) if btc is not None else None,
+        "hareketli": last_scan.get("hareketli", []),
+        "adaylar": last_scan["adaylar"],
+        "pozisyonlar": pozisyonlar,
+        "rotasyon_acik": ROTATE_ENABLED,
+        "bugunku_rotasyon": len([t for t in rotate_times if now - t < 86400]),
+    })
+
+
+@app.route("/journal")
+def journal_view():
+    """Kapanan islemlerin ozeti: islem sayisi, kazanma orani, net kar/zarar, islem basi beklenen deger + son kayitlar."""
+    rows = []
+    try:
+        with open(JOURNAL_FILE, newline="") as f:
+            rows = list(csv.DictReader(f))
+    except Exception:
+        pass
+    nets = []
+    for r in rows:
+        if r.get("event") == "close" and r.get("net_usdt") not in (None, ""):
+            try:
+                nets.append(float(r["net_usdt"]))
+            except ValueError:
+                pass
+    wins = [n for n in nets if n > 0]
+    losses = [n for n in nets if n <= 0]
+    return jsonify({
+        "kapanan_islem": len(nets),
+        "kazanan": len(wins),
+        "kazanma_orani_yuzde": round(len(wins) / len(nets) * 100, 1) if nets else None,
+        "net_toplam_usdt": round(sum(nets), 3) if nets else None,
+        "islem_basi_net_usdt": round(sum(nets) / len(nets), 4) if nets else None,
+        "ort_kazanc_usdt": round(sum(wins) / len(wins), 4) if wins else None,
+        "ort_kayip_usdt": round(sum(losses) / len(losses), 4) if losses else None,
+        "son_kayitlar": rows[-30:],
+    })
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
