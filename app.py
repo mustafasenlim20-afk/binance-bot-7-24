@@ -9,6 +9,8 @@ Binance USDT-M Futures botu (7/24) - WEBSOCKET VERI + REST SADECE ISLEM
 - Bot acilinca ~12 dk "isinma" yapar (fiyat gecmisi birikir), bu sure islem acmaz.
 - WebSocket calismazsa: kontrollu REST yedek modu (az coin, yavas, ban korumali)
 - 20M-1,5 milyar hacim araligi, 0-100 trend puani, LONG + SHORT
+- ERKEN TREND GIRISI: Squeeze cikisi / Aroon donusu / Choppiness dususu (en az 2'si) + ZORUNLU hacim sicramasi (>=1,5x, yon ile uyumlu mum)
+  + ADX sadece PUAN (taban ADX_MIN, yukselmeli). Yon: momentum/Aroon/DI cogunlugu. Eski trend degerlendirmesi sadece rotasyonda (evaluate_classic).
 - MACD HISTOGRAM TEYIDI: sinyal yonunde ve zayiflamayan momentum yoksa girilmez (yanlis sinyali azaltir, kesinlik GARANTI ETMEZ)
 - ATR stop-loss (marjinde en fazla %20 zarar), kismi kar al (MARJINE gore %25, pozisyonun %70'i), DARALAN ATR gezen stop,
   stop sonrasi bekleme, gunluk zarar limiti (%8)
@@ -49,6 +51,7 @@ from collections import deque
 from urllib.parse import urlparse, unquote
 
 import ccxt
+import numpy as np
 import pandas as pd
 from flask import Flask, jsonify
 
@@ -86,13 +89,35 @@ MIN_TREND_SCORE = 50       # bunun altindaki coine girilmez (dusurursen daha cok
 STRONG_SCORE = 70          # bu puan ve ustu = guclu trend
 HTF_CHECK_TOP = 10         # ust zaman dilimi teyidi en iyi kac coine yapilsin
 HTF_PTS = 15               # ust zaman dilimi uyumlu ise puan (belirsizse yarisi, ters ise elenir)
-ADX_MIN = 25               # bunun altinda trend yok sayilir (eskiden 20: yatay piyasada yanlis sinyal veriyordu)
+ADX_MIN = 10               # ERKEN GIRIS: ADX bu degerin altindaysa (tamamen olu piyasa) girilmez. Eskiden 25'ti; sikisma bitiminde ADX 10-15 civaridir, yuksek taban erken sinyali oldurur (testle dogrulandi: 14 bile ilk kirilim mumunu eliyor).
+ADX_FULL = 25              # ADX bu degere cikinca ADX puani tam alinir (14-25 arasi kademeli)
+ADX_CLASSIC_MIN = 25       # sadece ROTASYON kontrolunde (evaluate_classic) kullanilir, giris kararini etkilemez
 MIN_ATR_PCT = 0.005        # ATR / fiyat en az %0,5 (cok durgun coinde komisyon yer)
 MIN_REL_VOL = 0.7          # son 3 mum hacmi / onceki 20 mum ortalamasi en az bu olsun
 RSI_MAX_LONG = 75          # long'da RSI bunun ustundeyse trend yorulmus
 RSI_MIN_SHORT = 25         # short'ta RSI bunun altindaysa trend yorulmus
 MAX_EXT_ATR = 4.0          # fiyat EMA21'den 4 ATR'den fazla uzaksa gec kalinmis, girme
 BREAKOUT_BARS = 12         # kirilim icin bakilan onceki mum sayisi
+
+# --- ERKEN TREND SINYALLERI (yeni) ---
+# Mantik: 3 "erken tetik"ten en az EARLY_MIN_TRIGGERS tanesi + ZORUNLU hacim sicramasi + yonu belirleyen momentum.
+# ADX artik sart degil, sadece puan (ADX_MIN taban, ADX_FULL'a kadar kademeli).
+EARLY_MIN_TRIGGERS = 2     # squeeze cikisi / Aroon donusu / Choppiness dususu: en az kac tanesi olmali
+SQUEEZE_LOOKBACK = 6       # son kac mum icinde sikisma bitmis olabilir (sikisma bitisi tek mumluk olay degil)
+BB_PERIOD = 20             # Bollinger / Keltner periyodu
+BB_MULT = 2.0              # Bollinger bandi carpani
+KC_MULT = 1.5              # Keltner bandi carpani (BB, KC'nin icine girerse = sikisma)
+AROON_PERIOD = 14          # Aroon periyodu
+AROON_STRONG = 70          # yon tarafi bunun ustunde
+AROON_WEAK = 50            # ters taraf bunun altinda olmali
+CHOP_PERIOD = 14           # Choppiness periyodu
+CHOP_HIGH = 55             # son mumlarda bunun ustune cikmis (yatay) olmali ...
+CHOP_FALLING_BARS = 3      # ... ve su kadar mumdur dusuyor olmali (yataydan trende gecis)
+CHOP_LOOKBACK = 10         # CHOP_HIGH'in ne kadar geriye bakilacagi (mum)
+VOL_SPIKE_MIN = 1.5        # ZORUNLU: son 2 mumun en yuksek hacmi / onceki 20 mum ortalamasi en az bu olsun
+VOL_SPIKE_FULL = 3.0       # bu katta hacim puani tam
+ATR_REF_BARS = 96          # "durgun mu" kontrolunde bakilan uzun vadeli ATR ortalamasi (96 mum = 1 gun). Sikisma sirasinda anlik ATR dogal olarak dusuktur.
+ATR_FLOOR_RATIO = 0.6      # stop/gezen stop icin kullanilan ATR en az (1 gunluk ortalama ATR) x bu kadar olsun (sikismada stop asiri yakin kalip gurultuye takilmasin). 0 = kapali
 
 # --- MACD HISTOGRAM TEYIDI (yeni) ---
 # Long icin histogram > 0 ve bir onceki mumdan kucuk olmamali, short icin tersi.
@@ -1019,7 +1044,40 @@ def calculate_indicators(df):
     di_sum = (df["plus_di"] + df["minus_di"]).replace(0, float("nan"))
     dx = 100 * (df["plus_di"] - df["minus_di"]).abs() / di_sum
     df["adx"] = dx.ewm(alpha=1 / 14, adjust=False).mean()
+
+    # ---------- ERKEN TREND INDIKATORLERI ----------
+    # 1) Squeeze: Bollinger bandi Keltner'in icine girerse sikisma var (sq_on). Bitisi = hareketin baslangici.
+    ma = df["close"].rolling(BB_PERIOD).mean()
+    sd = df["close"].rolling(BB_PERIOD).std(ddof=0)
+    kc_atr = tr.rolling(BB_PERIOD).mean()
+    df["sq_on"] = ((ma + BB_MULT * sd) < (ma + KC_MULT * kc_atr)) & ((ma - BB_MULT * sd) > (ma - KC_MULT * kc_atr))
+
+    # 2) Squeeze momentum (LazyBear): fiyatin orta cizgiye gore sapmasinin dogrusal regresyon ucu. Isaret = yon.
+    mid = ((df["high"].rolling(BB_PERIOD).max() + df["low"].rolling(BB_PERIOD).min()) / 2.0 + ma) / 2.0
+    df["sq_mom"] = (df["close"] - mid).rolling(BB_PERIOD).apply(_linreg_end, raw=True)
+
+    # 3) Aroon: son N mumda en yuksek/en dusuk ne kadar yakin zamanda goruldu (0-100)
+    n = AROON_PERIOD
+    df["aroon_up"] = df["high"].rolling(n + 1).apply(np.argmax, raw=True) * (100.0 / n)
+    df["aroon_dn"] = df["low"].rolling(n + 1).apply(np.argmin, raw=True) * (100.0 / n)
+
+    # 4) Choppiness: yuksek = yatay/testere, dusuk = trend. Yuksekten dusmeye baslarsa yataydan trende gecis.
+    rng = (df["high"].rolling(CHOP_PERIOD).max() - df["low"].rolling(CHOP_PERIOD).min()).replace(0, np.nan)
+    df["chop"] = 100.0 * np.log10(tr.rolling(CHOP_PERIOD).sum() / rng) / np.log10(CHOP_PERIOD)
     return df
+
+
+def _linreg_end(y):
+    """Penceredeki degerlere dogru uydurur, dogrunun SON noktasini dondurur (squeeze momentum icin)."""
+    n = len(y)
+    x = np.arange(n, dtype=float)
+    xm = x.mean()
+    ym = y.mean()
+    var = ((x - xm) ** 2).sum()
+    if var == 0:
+        return np.nan
+    b = ((x - xm) * (y - ym)).sum() / var
+    return ym - b * xm + b * (n - 1)
 
 
 def get_df(symbol):
@@ -1075,7 +1133,135 @@ def fetch_df_rest(symbol, timeframe, limit=100):
 
 
 # ---------------- TREND PUANLAMA ----------------
+def _trigger_states(df, side):
+    """Uc erken tetigin yone gore durumunu dondurur: (squeeze_cikisi, aroon_donusu, chop_dususu)."""
+    sq = df["sq_on"].astype(bool)
+    last_sq_on = bool(sq.iloc[-1])
+    recent_on = bool(sq.iloc[-1 - SQUEEZE_LOOKBACK:-1].any())
+    squeeze_release = (not last_sq_on) and recent_on
+
+    def aroon_ok(i):
+        up, dn = float(df["aroon_up"].iloc[i]), float(df["aroon_dn"].iloc[i])
+        if side == "long":
+            return up >= AROON_STRONG and dn <= AROON_WEAK
+        return dn >= AROON_STRONG and up <= AROON_WEAK
+
+    # "donus": simdi saglaniyor ama 4 mum once saglanmiyordu (yani yeni dondu)
+    aroon_turn = aroon_ok(-1) and not aroon_ok(-5)
+
+    chop = df["chop"]
+    was_choppy = float(chop.iloc[-1 - CHOP_LOOKBACK:-1].max()) >= CHOP_HIGH
+    chop_falling = float(chop.iloc[-1]) < float(chop.iloc[-1 - CHOP_FALLING_BARS])
+    chop_break = was_choppy and chop_falling
+    return squeeze_release, aroon_turn, chop_break
+
+
 def evaluate(df):
+    """ERKEN TREND girisi. Sira: temel filtreler -> yon -> erken tetikler (en az 2) -> ZORUNLU hacim -> puan (0-100).
+    ADX zorunlu degil: ADX_MIN altindaysa (olu piyasa) elenir, ustunde kademeli puan verir."""
+    if len(df) < 60:
+        return None, "veri_az"
+    last = df.iloc[-1]
+    needed = ["adx", "rsi", "atr", "plus_di", "minus_di", "ema_fast", "ema_slow", "macd_hist",
+              "sq_mom", "aroon_up", "aroon_dn", "chop"]
+    if (any(pd.isna(last[k]) for k in needed) or pd.isna(df["adx"].iloc[-4]) or pd.isna(df["macd_hist"].iloc[-2])
+            or pd.isna(df["sq_mom"].iloc[-2]) or pd.isna(df["aroon_up"].iloc[-5]) or pd.isna(df["aroon_dn"].iloc[-5])
+            or pd.isna(df["chop"].iloc[-1 - max(CHOP_LOOKBACK, CHOP_FALLING_BARS)])):
+        return None, "veri_eksik"
+
+    close = float(last["close"])
+    atr = float(last["atr"])
+    adx = float(last["adx"])
+    rsi = float(last["rsi"])
+    if close <= 0 or atr <= 0:
+        return None, "veri_eksik"
+
+    atr_ref = float(df["atr"].iloc[-ATR_REF_BARS:].mean())
+    if max(atr, atr_ref) / close < MIN_ATR_PCT:      # hem su an hem gun ortalamasi durgunsa: komisyon yer, girme
+        return None, "durgun"
+    atr = max(atr, ATR_FLOOR_RATIO * atr_ref)        # sikisma bitiminde ATR kucuk: stop asiri dar olmasin
+    if adx < ADX_MIN:
+        return None, "adx_dusuk"
+    adx_rising = adx > float(df["adx"].iloc[-4])
+    if adx < ADX_FULL and not adx_rising:
+        return None, "adx_dusuyor"     # ADX dusukse YUKSELIYOR olmali (trend doguyor); dusuyorsa trend olu
+
+    # --- Yon: 3 gostergeden en az 2'si ayni yonde olmali ---
+    ef, es = float(last["ema_fast"]), float(last["ema_slow"])
+    mom = float(last["sq_mom"])
+    mom_prev = float(df["sq_mom"].iloc[-2])
+    # Squeeze momentumu yon degistirmekte gecikir; bu yuzden 3 gostergenin COGUNLUGU (momentum, Aroon, DI) yonu belirler.
+    long_votes = int(mom > 0) + int(last["aroon_up"] > last["aroon_dn"]) + int(last["plus_di"] > last["minus_di"])
+    short_votes = int(mom < 0) + int(last["aroon_dn"] > last["aroon_up"]) + int(last["minus_di"] > last["plus_di"])
+    if long_votes >= 2 and long_votes > short_votes:
+        side = "long"
+    elif short_votes >= 2 and short_votes > long_votes:
+        side = "short"
+    else:
+        return None, "yon_belirsiz"
+
+    if side == "long" and rsi > RSI_MAX_LONG:
+        return None, "rsi_asiri"
+    if side == "short" and rsi < RSI_MIN_SHORT:
+        return None, "rsi_asiri"
+    if abs(close - es) / atr > MAX_EXT_ATR:
+        return None, "gec_kalmis"
+
+    # MACD teyidi (mevcut ayar): momentum sinyal yonunde ve zayiflamiyor olmali
+    if MACD_FILTER_ENABLED:
+        mh = float(last["macd_hist"])
+        mh_prev = float(df["macd_hist"].iloc[-2])
+        if side == "long" and not (mh > 0 and mh >= mh_prev):
+            return None, "macd_zayif"
+        if side == "short" and not (mh < 0 and mh <= mh_prev):
+            return None, "macd_zayif"
+
+    per_hour = max(int(3_600_000 // TF_MS), 1)
+    if len(df) > per_hour:
+        ref_close = float(df["close"].iloc[-1 - per_hour])
+        if ref_close > 0 and abs(close / ref_close - 1.0) > MAX_MOVE_1H:
+            return None, "pump_1s"
+
+    # --- Erken tetikler: en az EARLY_MIN_TRIGGERS tanesi ---
+    sq_rel, aroon_turn, chop_break = _trigger_states(df, side)
+    trig = [name for name, ok in (("squeeze", sq_rel), ("aroon", aroon_turn), ("chop", chop_break)) if ok]
+    if len(trig) < EARLY_MIN_TRIGGERS:
+        return None, "erken_sinyal_yok"
+
+    # --- ZORUNLU hacim sicramasi: son 2 mumun en yuksegi / onceki 20 mum ortalamasi ---
+    vol_base = float(df["volume"].iloc[-22:-2].mean())
+    v2 = df["volume"].iloc[-2:]
+    spike = float(v2.max()) / vol_base if vol_base > 0 else 0.0
+    if spike < VOL_SPIKE_MIN:
+        return None, "hacim_dusuk"
+    spike_candle = df.iloc[-2:].loc[v2.idxmax()]
+    if (side == "long" and spike_candle["close"] < spike_candle["open"]) or \
+       (side == "short" and spike_candle["close"] > spike_candle["open"]):
+        return None, "hacim_ters"      # hacim ters yonlu mumda patlamis: yon teyidi degil
+
+    # --- Puan (0-100; ust zaman dilimi puani sonradan eklenir) ---
+    trig_pts = (15 if sq_rel else 0) + (15 if aroon_turn else 0) + (10 if chop_break else 0)           # 40
+    vol_pts = 10 + 10 * clamp((spike - VOL_SPIKE_MIN) / (VOL_SPIKE_FULL - VOL_SPIKE_MIN), 0, 1)       # 10-20
+    adx_pts = 15 * clamp((adx - ADX_MIN) / (ADX_FULL - ADX_MIN), 0, 1) + (5 if adx_rising else 0)      # 20
+    mom_up = (mom > mom_prev) if side == "long" else (mom < mom_prev)
+    mom_pts = (5 if mom_up else 0) + 5 * clamp(abs(mom) / atr, 0, 1)                                    # 10
+    if side == "long":
+        rsi_pts = 5 if 50 <= rsi <= 68 else (2 if 45 <= rsi <= RSI_MAX_LONG else 0)
+        breakout = close > float(df["high"].iloc[-1 - BREAKOUT_BARS:-1].max())
+    else:
+        rsi_pts = 5 if 32 <= rsi <= 50 else (2 if RSI_MIN_SHORT <= rsi <= 55 else 0)
+        breakout = close < float(df["low"].iloc[-1 - BREAKOUT_BARS:-1].min())
+    breakout_pts = 5 if breakout else 0
+
+    score = trig_pts + vol_pts + adx_pts + mom_pts + rsi_pts + breakout_pts
+    return {
+        "side": side, "score": score, "atr": atr, "price": close,
+        "adx": adx, "rv": spike, "rsi": rsi, "htf": "-", "trig": "+".join(trig),
+    }, "ok"
+
+
+def evaluate_classic(df):
+    """ESKI (gec ama saglam) trend degerlendirmesi: sadece ROTASYONDA 'pozisyonun trendi suruyor mu' diye bakmak icin."""
     if len(df) < 60:
         return None, "veri_az"
     last = df.iloc[-1]
@@ -1092,7 +1278,7 @@ def evaluate(df):
 
     if atr / close < MIN_ATR_PCT:
         return None, "durgun"
-    if adx < ADX_MIN:
+    if adx < ADX_CLASSIC_MIN:
         return None, "adx_dusuk"
 
     ef, es = float(last["ema_fast"]), float(last["ema_slow"])
@@ -1131,7 +1317,7 @@ def evaluate(df):
     if rv < MIN_REL_VOL:
         return None, "hacim_dusuk"
 
-    adx_pts = 25 * clamp((adx - ADX_MIN) / (40 - ADX_MIN), 0, 1)
+    adx_pts = 25 * clamp((adx - ADX_CLASSIC_MIN) / (40 - ADX_CLASSIC_MIN), 0, 1)
     rising_pts = 10 if adx > float(df["adx"].iloc[-4]) else 0
     spread_pts = 10 * clamp(abs(ef - es) / atr, 0, 1)
     vol_pts = 20 * clamp((rv - 0.8) / 1.2, 0, 1)
@@ -1267,14 +1453,14 @@ def scan_market(skip):
              f"Ust trend teyidi gecen: {len(final)}")
     for c in final[:5]:
         log.info(f"  ⭐ {c['symbol']} {c['side'].upper()} puan={c['score']:.0f} adx={c['adx']:.0f} "
-                 f"hacimx={c['rv']:.1f} rsi={c['rsi']:.0f} 1s={c['htf']}")
+                 f"hacimx={c['rv']:.1f} rsi={c['rsi']:.0f} 1s={c['htf']} tetik={c.get('trig', '-')}")
     last_scan = {
         "time": time.time(),
         "kaynak": "WebSocket" if ws_ok else "REST yedek",
         "hareketli": movers_view,
         "adaylar": [{"coin": c["symbol"], "yon": c["side"], "puan": round(c["score"]),
                      "adx": round(c["adx"]), "hacim_x": round(c["rv"], 1), "rsi": round(c["rsi"]),
-                     "ust_trend": c["htf"]} for c in final[:10]],
+                     "ust_trend": c["htf"], "tetik": c.get("trig", "-")} for c in final[:10]],
     }
 
     ready = [c for c in final if c["score"] >= MIN_TREND_SCORE]
@@ -1958,9 +2144,10 @@ def open_trade(cand, open_symbols):
         mv = (TP1_MARGIN_PCT / 100.0) / max(lev, 1)
         tp_p = cand["price"] * (1 + mv) if side == "long" else cand["price"] * (1 - mv)
         log.info(f"📝 [KAGIT MODU] {side.upper()} {symbol} puan={cand['score']:.0f} fiyat={cand['price']} "
-                 f"SL={sl_p:.8g} TP1={tp_p:.8g} (emir verilmedi)")
+                 f"SL={sl_p:.8g} TP1={tp_p:.8g} tetik={cand.get('trig', '-')} adx={cand.get('adx', 0):.0f} "
+                 f"hacimx={cand.get('rv', 0):.1f} (emir verilmedi)")
         journal("signal", symbol, side=side, score=round(cand["score"]), lev=lev, entry=cand["price"],
-                sl=round(sl_p, 10), tp=round(tp_p, 10), reason="kagit modu (emir verilmedi)")
+                sl=round(sl_p, 10), tp=round(tp_p, 10), reason=f"kagit modu (emir verilmedi) tetik={cand.get('trig', '-')} adx={cand.get('adx', 0):.0f} hacimx={cand.get('rv', 0):.1f}")
         with trail_lock:
             cooldown[symbol] = time.time() + 30 * 60        # ayni sinyal her turda tekrar loglanmasin
             save_state()
@@ -2090,7 +2277,7 @@ def own_trend_score(symbol, side):
         df = get_df(symbol)
         if df is None:
             return 0.0
-        cand, _ = evaluate(df)
+        cand, _ = evaluate_classic(df)
         if cand and cand["side"] == side:
             return float(cand["score"])
     except Exception:
@@ -2142,233 +2329,3 @@ def close_position_for_rotation(symbol):
                 if c > 0:
                     amount = float(ex.amount_to_precision(symbol, c))
                 break
-    except Exception as e:
-        log.error(f"{symbol} rotasyon: pozisyon miktari okunamadi: {e}")
-        note_ban(e)
-        return False
-    if not amount:
-        return False                      # zaten kapanmis: sync_positions temizler
-    if not emergency_close(symbol, side, amount, neden="rotasyon"):
-        return False
-    cancel_all_safe(symbol)
-    with trail_lock:
-        closed_st = trail_state.pop(symbol, None)
-        cooldown[symbol] = time.time() + COOLDOWN_SECONDS
-        save_state()
-    journal_close(symbol, closed_st, "rotasyon (bayat pozisyon)")
-    return True
-
-
-def rotate_if_needed(open_symbols):
-    """Pozisyon limiti doluyken calisir. Bayat pozisyon varsa ve guclu (>= ROTATE_MIN_SCORE) bir trend bulunursa
-    bayati kapatip yeni coine girer. Rotasyon yapildiysa True doner."""
-    if not ROTATE_ENABLED or not TRADING_ENABLED:
-        return False
-    now = time.time()
-    with rotate_lock:
-        rotate_times[:] = [t for t in rotate_times if now - t < 86400]
-        if rotate_times and now - rotate_times[-1] < ROTATE_GAP_SECONDS:
-            return False
-        if len(rotate_times) >= ROTATE_MAX_PER_DAY:
-            return False
-
-    stale = find_stale_positions()
-    if not stale:
-        return False
-    names = ", ".join(f"{s.split('/')[0]} (%{p:+.1f}, {a:.0f} dk, puan {o:.0f})" for s, p, a, o in stale)
-    log.info(f"💤 Bayat pozisyon(lar): {names}. Daha guclu trend araniyor...")
-
-    if daily_loss_hit():
-        return False
-
-    with trail_lock:
-        skip = set(open_symbols) | set(cooldown.keys())
-    candidates = scan_market(skip)
-    strong = [c for c in candidates if c["score"] >= ROTATE_MIN_SCORE]
-    if not strong:
-        log.info(f"Rotasyon icin yeterince guclu trend yok (esik {ROTATE_MIN_SCORE}), bayat pozisyon korunuyor.")
-        return False
-
-    cand = strong[0]
-    symbol, pnl, age_min, own = stale[0]
-    log.info(f"🔄 ROTASYON: {symbol} (%{pnl:+.1f}, {age_min:.0f} dk, puan {own:.0f}) kapatilip "
-             f"{cand['symbol']} {cand['side'].upper()} (puan {cand['score']:.0f}) acilacak.")
-    if not close_position_for_rotation(symbol):
-        log.warning(f"{symbol} rotasyon icin kapatilamadi, yeni islem acilmadi.")
-        return False
-    if symbol in open_symbols:
-        open_symbols.remove(symbol)
-    with rotate_lock:
-        rotate_times.append(time.time())
-    try:
-        open_trade(cand, open_symbols)
-    except Exception as e:
-        log.error(f"{cand['symbol']} rotasyon sonrasi islem acma hatasi: {e}")
-        note_ban(e)
-    return True
-
-
-def bot_loop():
-    log.info("Bot arkaplan dongusu basladi.")
-    if not TRADING_ENABLED:
-        log.warning("📝 KAGIT MODU: TRADING_ENABLED=0, bot emir vermeyecek, sadece sinyalleri loglayacak.")
-    while True:
-        wait_if_banned()
-        try:
-            try:
-                open_symbols = get_open_symbols()
-            except Exception as e:
-                log.error(f"Pozisyonlar cekilemedi: {e}")
-                note_ban(e)
-                time.sleep(30)
-                continue
-
-            if len(open_symbols) >= MAX_OPEN:
-                log.info(f"Pozisyon limiti dolu ({len(open_symbols)}/{MAX_OPEN}), yeni tarama yapilmadi.")
-                try:
-                    rotate_if_needed(open_symbols)
-                except Exception as e:
-                    log.error(f"Rotasyon hatasi: {e}")
-                    note_ban(e)
-                time.sleep(LOOP_SECONDS)
-                continue
-
-            if daily_loss_hit():
-                time.sleep(LOOP_SECONDS)
-                continue
-
-            now = time.time()
-            with trail_lock:
-                for s in [s for s, t in cooldown.items() if t <= now]:
-                    cooldown.pop(s, None)
-                skip = set(open_symbols) | set(cooldown.keys())
-
-            candidates = scan_market(skip)
-            if not candidates:
-                log.info("Bu turda esigi gecen trend yok, islem acilmadi.")
-
-            for cand in candidates:
-                if len(open_symbols) >= MAX_OPEN:
-                    break
-                if cand["symbol"] in open_symbols:
-                    continue
-                try:
-                    open_trade(cand, open_symbols)
-                    time.sleep(2)
-                except Exception as inner_err:
-                    log.error(f"{cand['symbol']} islem hatasi: {inner_err}")
-                    if "-4411" in str(inner_err):
-                        # TradFi-Perps sozlesmesi imzalanmamis (hisse/emtia vadelisi): 24 saat atla
-                        with trail_lock:
-                            cooldown[cand["symbol"]] = time.time() + 24 * 3600
-                            save_state()
-                        log.warning(f"🚫 {cand['symbol']} TradFi-Perps sozlesmesi gerektiriyor, 24 saat atlanacak.")
-                        continue
-                    if note_ban(inner_err):
-                        break
-
-        except Exception as e:
-            log.error(f"Dongu hatasi: {e}")
-            note_ban(e)
-
-        time.sleep(LOOP_SECONDS)
-
-
-_started = False
-_start_lock = threading.Lock()
-
-
-def start_bot_once():
-    global _started
-    with _start_lock:
-        if not _started:
-            _started = True
-            load_state()
-            _load_ban()
-            threading.Thread(target=ws_thread, daemon=True).start()
-            threading.Thread(target=bot_loop, daemon=True).start()
-            threading.Thread(target=trail_loop, daemon=True).start()
-
-
-start_bot_once()
-
-
-@app.route("/")
-def index():
-    return jsonify({
-        "status": "running",
-        "emir_veriyor": TRADING_ENABLED,
-        "websocket": ws_healthy(),
-        "websocket_bagli": ws_connected,
-        "fiyat_yasi_sn": round(time.time() - tickers_ts, 1) if tickers_ts else None,
-        "izlenen_coin": len(subscribed),
-        "takip_edilen": list(trail_state.keys()),
-        "bekleyen_coin": len(cooldown),
-    })
-
-
-@app.route("/scan")
-def scan_view():
-    """Hareketli coinler + son tarama adaylari + acik pozisyonlarin durumu (kar %, yas, rotasyona aday mi)."""
-    now = time.time()
-    with trail_lock:
-        snap = {s: dict(st) for s, st in trail_state.items()}
-    stale_names = {s for s, _, _, _ in find_stale_positions()}
-    pozisyonlar = []
-    for s, st in snap.items():
-        with ws_lock:
-            t = tickers.get(to_raw(s))
-        pnl = position_pnl_margin_pct(st, t["price"]) if t else None
-        pozisyonlar.append({
-            "coin": s,
-            "yon": st.get("side"),
-            "kar_marjin_yuzde": round(pnl, 2) if pnl is not None else None,
-            "yas_dk": round((now - float(st.get("opened_at") or now)) / 60),
-            "bayat": s in stale_names,
-        })
-    btc = btc_change_pct()
-    return jsonify({
-        "son_tarama_sn_once": round(now - last_scan["time"]) if last_scan["time"] else None,
-        "tarama_kaynagi": last_scan["kaynak"],
-        "btc_son_15dk_yuzde": round(btc, 2) if btc is not None else None,
-        "hareketli": last_scan.get("hareketli", []),
-        "adaylar": last_scan["adaylar"],
-        "pozisyonlar": pozisyonlar,
-        "rotasyon_acik": ROTATE_ENABLED,
-        "bugunku_rotasyon": len([t for t in rotate_times if now - t < 86400]),
-    })
-
-
-@app.route("/journal")
-def journal_view():
-    """Kapanan islemlerin ozeti: islem sayisi, kazanma orani, net kar/zarar, islem basi beklenen deger + son kayitlar."""
-    rows = []
-    try:
-        with open(JOURNAL_FILE, newline="") as f:
-            rows = list(csv.DictReader(f))
-    except Exception:
-        pass
-    nets = []
-    for r in rows:
-        if r.get("event") == "close" and r.get("net_usdt") not in (None, ""):
-            try:
-                nets.append(float(r["net_usdt"]))
-            except ValueError:
-                pass
-    wins = [n for n in nets if n > 0]
-    losses = [n for n in nets if n <= 0]
-    return jsonify({
-        "kapanan_islem": len(nets),
-        "kazanan": len(wins),
-        "kazanma_orani_yuzde": round(len(wins) / len(nets) * 100, 1) if nets else None,
-        "net_toplam_usdt": round(sum(nets), 3) if nets else None,
-        "islem_basi_net_usdt": round(sum(nets) / len(nets), 4) if nets else None,
-        "ort_kazanc_usdt": round(sum(wins) / len(wins), 4) if wins else None,
-        "ort_kayip_usdt": round(sum(losses) / len(losses), 4) if losses else None,
-        "son_kayitlar": rows[-30:],
-    })
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
