@@ -147,7 +147,7 @@ EARLY_NEED = 2                 # super hacim / OI artiyor / funding sakin: en az
 EARLY_RISK_FACTOR = 0.5        # erken tetikte risk carpani (%3 -> %1.5)
 
 # --- KAGIT MODU SAYACI ---
-PAPER_MODE = True              # True: emir YOK, sadece sanal sonuc sayilir. Gercek islem icin False yap.
+PAPER_MODE = False              # True: emir YOK, sadece sanal sonuc sayilir. Gercek islem icin False yap.
 PAPER_FEE_PCT = 0.10           # gidis-donus komisyon (fiyatin %'si); kayma ve funding odemesi dahil degil
 PAPER_MAX_HOURS = 24           # bu surede stop/kar-al gelmezse o anki fiyattan kapanir
 PAPER_MAX_GAP = 120            # fiyat takibinde bu kadar sn bosluk olursa sinyal sayilmaz
