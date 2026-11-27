@@ -176,7 +176,7 @@ BREAKEVEN_AT_ATR = 1.5     # kar bu kadar ATR olunca stop en az girise cekilir
 FEE_BUFFER_PCT = 0.12      # stop girise cekilirken eklenen komisyon payi (fiyatin %'si)
 
 COOLDOWN_SECONDS = 2 * 3600   # bir coin kapaninca bu sure tekrar girilmez
-DAILY_LOSS_LIMIT_PCT = 10.0   # gun basi bakiyeye gore bu kadar zarar olursa gun sonuna kadar yeni islem yok
+DAILY_LOSS_LIMIT_PCT = 25.0   # gun basi bakiyeye gore bu kadar zarar olursa gun sonuna kadar yeni islem yok
 LOSS_LOG_EVERY = 3600         # "limit doldu" uyarisi en fazla bu kadar sn'de bir loga yazilir
 BACKUP_STOP_GAP_PCT = 0.5     # fiyat stopu bu kadar (%) gecip pozisyon hala aciksa bot kendisi kapatir
 ALLOW_LONG = True
